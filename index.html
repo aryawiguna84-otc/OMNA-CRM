@@ -754,6 +754,7 @@ function render(){
   const banner = (state.showImportBanner ? renderImportBanner() : '') + (state.showImportBanner2025 ? renderImportBanner2025() : '');
   if(state.view === 'dashboard') el.innerHTML = banner + renderDashboard();
   else if(state.view === 'settings') el.innerHTML = renderSettings();
+  else if(state.filterCorridor) el.innerHTML = banner + renderDashboard(state.filterCorridor) + renderTable();
   else el.innerHTML = banner + renderTable();
 }
 function renderSettings(){
@@ -840,16 +841,17 @@ function renderSidebar(){
   }).join('');
 }
 
-function renderDashboard(){
-  const total = state.candidates.length;
-  const stageCounts = state.stages.map(s => state.candidates.filter(c=>c.stage===s).length);
+function renderDashboard(corridor){
+  const list = corridor ? state.candidates.filter(c=>c.corridor===corridor) : state.candidates;
+  const total = list.length;
+  const stageCounts = state.stages.map(s => list.filter(c=>c.stage===s).length);
   const lastStage = state.stages[state.stages.length-1];
-  const activeCount = state.candidates.filter(c=>c.stage!==lastStage).length;
-  const newHireCount = state.candidates.filter(c=>c.candidateStatus==='New Hire').length;
-  const repeaterCount = state.candidates.filter(c=>c.candidateStatus==='Repeater').length;
+  const activeCount = list.filter(c=>c.stage!==lastStage).length;
+  const newHireCount = list.filter(c=>c.candidateStatus==='New Hire').length;
+  const repeaterCount = list.filter(c=>c.candidateStatus==='Repeater').length;
 
   let deadlines = [];
-  state.candidates.forEach(c=>{
+  list.forEach(c=>{
     (c.documents||[]).forEach(d=>{
       if(d.deadline && !d.done){
         deadlines.push({candidateId:c.id, candidateName:c.name, corridor:c.corridor, doc:d.name, date:d.deadline});
@@ -883,11 +885,14 @@ function renderDashboard(){
     return '<div class="stat-card"><div class="num">'+stageCounts[i]+'</div><div class="label">'+s+'</div></div>';
   }).join('');
 
-  return '<div class="eyebrow">Operations overview</div>'+
+  const placementCard = corridor ? '' :
+    '<div class="stat-card"><div class="num">'+state.corridors.length+'</div><div class="label">Active placements</div></div>';
+
+  return '<div class="eyebrow">'+(corridor ? 'Operations overview \u2014 '+escapeHtml(corridor) : 'Operations overview')+'</div>'+
     '<div class="stat-grid">'+
     '<div class="stat-card"><div class="num">'+total+'</div><div class="label">Total candidates</div></div>'+
     '<div class="stat-card"><div class="num">'+activeCount+'</div><div class="label">In progress</div></div>'+
-    '<div class="stat-card"><div class="num">'+state.corridors.length+'</div><div class="label">Active placements</div></div>'+
+    placementCard+
     '<div class="stat-card"><div class="num">'+newHireCount+'</div><div class="label">New Hire</div></div>'+
     '<div class="stat-card"><div class="num">'+repeaterCount+'</div><div class="label">Repeater</div></div>'+
     '<div class="stat-card"><div class="num">'+deadlines.filter(d=>daysUntil(d.date)<0).length+'</div><div class="label">Expired documents</div></div>'+
