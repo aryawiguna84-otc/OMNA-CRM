@@ -1523,9 +1523,10 @@ function renderDrawer(){
     '<div class="drawer-section">'+
     '<h4>Documents &amp; expiration dates</h4>'+
     docsHtml+
-    '<div class="add-item-row">'+
-    '<input id="new-doc-name" placeholder="Document name">'+
+    '<div class="add-item-row" style="flex-wrap:wrap;">'+
+    '<input id="new-doc-name" placeholder="Document name" style="flex:1 1 140px;">'+
     '<input id="new-doc-date" type="date" title="Expiration date" style="max-width:130px;">'+
+    '<input id="new-doc-file" type="file" style="max-width:160px; font-size:11px;">'+
     '<button class="btn btn-sm" onclick="addDoc()">Add</button>'+
     '</div>'+
     '<div class="file-hint">Set the expiration date of each document (passport, visa, contract, etc.) so it shows up under Upcoming document expirations on the dashboard.</div>'+
@@ -1606,16 +1607,32 @@ function changeStage(s){
   render();
   showToast('Stage updated: ' + s);
 }
-function addDoc(){
+async function addDoc(){
   const c = getActive(); if(!c) return;
   const name = document.getElementById('new-doc-name').value.trim();
   const deadline = document.getElementById('new-doc-date').value;
+  const fileInput = document.getElementById('new-doc-file');
+  const file = fileInput && fileInput.files && fileInput.files[0];
   if(!name){ showToast('Document name is required.'); return; }
-  c.documents = c.documents || [];
-  c.documents.push({id:uid('d'), name, deadline: deadline || null, done:false, fileId:null});
-  saveCandidates();
-  renderDrawer();
-  render();
+  if(file && file.size > 4*1024*1024){ showToast('File is too large (max 4 MB).'); return; }
+  const doc = {id:uid('d'), name, deadline: deadline || null, done:false, fileId:null};
+  try{
+    if(file){
+      const dataUrl = await readFileAsDataUrl(file);
+      const newFile = { id: uid('f'), name: file.name, size: file.size, type: file.type, dataUrl, uploadedAt: new Date().toISOString().slice(0,10) };
+      state.activeFiles = state.activeFiles || [];
+      state.activeFiles.push(newFile);
+      doc.fileId = newFile.id;
+      await saveActiveFiles();
+    }
+    c.documents = c.documents || [];
+    c.documents.push(doc);
+    await saveCandidates();
+    renderDrawer();
+    render();
+  }catch(e){
+    showToast('Failed to add document. Please try again.');
+  }
 }
 function handleDocFileUpload(event, docId){
   const input = event.target;
@@ -1709,7 +1726,6 @@ async function addPay(){
   const file = fileInput && fileInput.files && fileInput.files[0];
   if(!desc){ showToast('Payment description is required.'); return; }
   if(file && file.size > 4*1024*1024){ showToast('File is too large (max 4 MB).'); return; }
-
   const payment = {id:uid('p'), desc, amount: Number(amount)||0, status:'unpaid', date, fileId:null};
   try{
     if(file){
