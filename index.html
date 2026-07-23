@@ -484,7 +484,7 @@ window.storage = (function(){
   };
 })();
 
-const DEFAULT_STAGES = ['Registration','Document Verification','Interview','Visa Submitted','Visa Approved','Departed','Completed'];
+const DEFAULT_STAGES = ['Registration','Document Verification','Interview','Visa Submitted','Visa Denial','Visa Approved','Departed','Completed'];
 const DEFAULT_CORRIDORS = ['Turkey','Croatia','Albania','Montenegro','Japan','Brunei Darussalam','Greece'];
 const DEFAULT_CUSTOM_FIELDS = [];
 const DEFAULT_DOC_TEMPLATES = {};
@@ -582,6 +582,12 @@ async function loadData(){
     const st = await window.storage.get('stages', true);
     state.stages = st ? JSON.parse(st.value) : [...DEFAULT_STAGES];
   }catch(e){ state.stages = [...DEFAULT_STAGES]; }
+  if(!state.stages.includes('Visa Denial')){
+    const submittedIdx = state.stages.indexOf('Visa Submitted');
+    if(submittedIdx === -1) state.stages.push('Visa Denial');
+    else state.stages.splice(submittedIdx + 1, 0, 'Visa Denial');
+    try{ await saveStages(); }catch(e){}
+  }
   try{
     const dt = await window.storage.get('docTemplates', true);
     state.docTemplates = dt ? JSON.parse(dt.value) : {};
@@ -982,7 +988,7 @@ function openAddCandidate(){
     '<div class="field"><label>Placement</label><select id="nc-corridor">'+corridorOptions+'</select></div>'+
     '<div class="field"><label>Phone</label><input id="nc-phone" placeholder="08xx-xxxx-xxxx"></div>'+
     '</div>'+
-    '<div class="field"><label>Candidate status</label><select id="nc-status"><option value="">Not set</option><option value="New Hire">New Hire</option><option value="Repeater">Repeater</option></select></div>'+
+    '<div class="field"><label>Candidate status</label><select id="nc-status"><option value="">Not set</option><option value="New Hire">New Hire</option><option value="Repeater">Repeater</option><option value="Resign">Resign</option></select></div>'+
     '<div class="field"><label>Initial note (optional)</label><textarea id="nc-notes" placeholder="Short note..."></textarea></div>'+
     '<div class="modal-actions">'+
     '<button class="btn" onclick="closeModal()">Cancel</button>'+
@@ -1515,6 +1521,7 @@ function renderDrawer(){
     '<option value=""'+(!c.candidateStatus?' selected':'')+'>Not set</option>'+
     '<option value="New Hire"'+(c.candidateStatus==='New Hire'?' selected':'')+'>New Hire</option>'+
     '<option value="Repeater"'+(c.candidateStatus==='Repeater'?' selected':'')+'>Repeater</option>'+
+    '<option value="Resign"'+(c.candidateStatus==='Resign'?' selected':'')+'>Resign</option>'+
     '</select></div>'+
     '<div class="field"><label>National ID (NIK)</label><input id="ed-nik" value="'+escapeAttr(c.nik||'')+'" placeholder="16-digit ID number" onchange="updateField(\'nik\', this.value)"></div>'+
     '<div class="field-row">'+
