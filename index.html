@@ -664,7 +664,16 @@ function renderImportBanner2025(){
 async function saveCandidates(){
   try{
     await window.storage.set('candidates', JSON.stringify(state.candidates), true);
-  }catch(e){ showToast('Failed to save. Please try again.'); }
+    return true;
+  }catch(e){ showToast('Failed to save. Please try again.'); return false; }
+}
+async function saveCandidateNow(){
+  const c = getActive(); if(!c) return;
+  const btn = event && event.target;
+  if(btn){ btn.disabled = true; btn.textContent = 'Saving...'; }
+  const ok = await saveCandidates();
+  if(btn){ btn.disabled = false; btn.textContent = 'Save changes'; }
+  if(ok) showToast('Changes saved.');
 }
 async function saveCorridors(){
   try{
@@ -1215,19 +1224,16 @@ function exportCSV(){
     return row;
   });
 
-  let csv = '\ufeff' + headers.map(csvEscape).join(',') + '\r\n';
-  rows.forEach(r=>{ csv += r.map(csvEscape).join(',') + '\r\n'; });
-
-  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
+  if(typeof XLSX === 'undefined'){
+    showToast('Export library did not load. Check your connection and try again.');
+    return;
+  }
+  const wsData = [headers].concat(rows);
+  const ws = XLSX.utils.aoa_to_sheet(wsData);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Candidates');
   const today = new Date().toISOString().slice(0,10);
-  a.href = url;
-  a.download = 'omna-candidates-' + today + '.csv';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  XLSX.writeFile(wb, 'omna-candidates-' + today + '.xlsx');
   showToast('Export downloaded (' + rows.length + ' candidates).');
 }
 
@@ -1398,6 +1404,10 @@ function renderDrawer(){
   const fileById = {};
   (state.activeFiles||[]).forEach(f=>{ fileById[f.id] = f; });
   const customFieldsHtml = state.customFields.length ? state.customFields.map(f=>{
+    if(f.id === 'cf_age'){
+      const computedAge = calcAge(c.birthDate);
+      return '<div class="field"><label>'+escapeHtml(f.label)+'</label><input type="text" value="'+escapeAttr(computedAge)+'" disabled title="Calculated automatically from date of birth" style="background:var(--paper); color:var(--ink-soft);"></div>';
+    }
     const val = (c.customValues && c.customValues[f.id]) || '';
     const inputType = f.type === 'date' ? 'date' : (f.type === 'number' ? 'number' : 'text');
     return '<div class="field"><label>'+escapeHtml(f.label)+'</label><input type="'+inputType+'" value="'+escapeAttr(val)+'" onchange="updateCustomField(\''+f.id+'\', this.value)"></div>';
@@ -1466,7 +1476,10 @@ function renderDrawer(){
     (photoFile ? '<img class="avatar-sm" style="width:34px;height:34px;border-radius:8px;" src="'+photoFile.dataUrl+'">' : '')+
     '<div><h2>'+escapeHtml(c.name)+'</h2><span class="id-tag">'+candidateIdLabel(c)+'</span></div>'+
     '</div>'+
-    '<button class="close-x" onclick="closeDrawer()">&times;</button>'+
+    '<div style="display:flex; align-items:center; gap:8px;">'+
+    '<button class="btn btn-sm btn-primary" onclick="saveCandidateNow()">Save changes</button>'+
+    '<button class="close-x" onclick="closeDrawer()" style="width:auto; padding:6px 12px; font-size:13px;">Close</button>'+
+    '</div>'+
     '</div></div>'+
     '<div class="drawer-body">'+
 
@@ -1593,9 +1606,24 @@ function updateCorridorField(value){
   renderDrawer();
   render();
 }
+function calcAge(birthDateStr){
+  if(!birthDateStr) return '';
+  const bd = new Date(birthDateStr + 'T00:00:00');
+  if(isNaN(bd)) return '';
+  const today = new Date();
+  let age = today.getFullYear() - bd.getFullYear();
+  const m = today.getMonth() - bd.getMonth();
+  if(m < 0 || (m === 0 && today.getDate() < bd.getDate())) age--;
+  return age >= 0 ? String(age) : '';
+}
 function updateField(field, value){
   const c = getActive(); if(!c) return;
   c[field] = value;
+  if(field === 'birthDate'){
+    c.customValues = c.customValues || {};
+    const age = calcAge(value);
+    if(age !== '') c.customValues['cf_age'] = age; else delete c.customValues['cf_age'];
+  }
   saveCandidates();
   render();
 }
