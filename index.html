@@ -1431,8 +1431,8 @@ function renderDrawer(){
     const linkedFile = d.fileId ? fileById[d.fileId] : null;
     let fileControl;
     if(linkedFile){
-      fileControl = '<a class="doc-file-link" href="'+linkedFile.dataUrl+'" target="_blank" rel="noopener" title="View '+escapeAttr(linkedFile.name)+'">'+escapeHtml(linkedFile.name)+'</a>'+
-        '<a class="doc-link-btn" href="'+linkedFile.dataUrl+'" download="'+escapeAttr(linkedFile.name)+'" title="Download">&darr;</a>'+
+      fileControl = '<a class="doc-file-link" href="#" onclick="viewStoredFileById(\''+linkedFile.id+'\'); return false;" title="View '+escapeAttr(linkedFile.name)+'">'+escapeHtml(linkedFile.name)+'</a>'+
+        '<a class="doc-link-btn" href="#" onclick="downloadStoredFileById(\''+linkedFile.id+'\'); return false;" title="Download">&darr;</a>'+
         '<button class="doc-link-btn" title="Unlink file" onclick="unlinkDocFile(\''+d.id+'\')">&times;</button>';
     } else {
       fileControl = '<label class="doc-link-btn" title="Attach file" style="cursor:pointer;">&#128206;'+
@@ -1451,8 +1451,8 @@ function renderDrawer(){
     const linkedPayFile = p.fileId ? fileById[p.fileId] : null;
     let payFileControl;
     if(linkedPayFile){
-      payFileControl = '<a class="doc-file-link" href="'+linkedPayFile.dataUrl+'" target="_blank" rel="noopener" title="View '+escapeAttr(linkedPayFile.name)+'">'+escapeHtml(linkedPayFile.name)+'</a>'+
-        '<a class="doc-link-btn" href="'+linkedPayFile.dataUrl+'" download="'+escapeAttr(linkedPayFile.name)+'" title="Download">&darr;</a>'+
+      payFileControl = '<a class="doc-file-link" href="#" onclick="viewStoredFileById(\''+linkedPayFile.id+'\'); return false;" title="View '+escapeAttr(linkedPayFile.name)+'">'+escapeHtml(linkedPayFile.name)+'</a>'+
+        '<a class="doc-link-btn" href="#" onclick="downloadStoredFileById(\''+linkedPayFile.id+'\'); return false;" title="Download">&darr;</a>'+
         '<button class="doc-link-btn" title="Unlink file" onclick="unlinkPayFile(\''+p.id+'\')">&times;</button>';
     } else {
       payFileControl = '<label class="doc-link-btn" title="Attach receipt / proof of payment" style="cursor:pointer;">&#128206;'+
@@ -1472,9 +1472,9 @@ function renderDrawer(){
 
   const filesHtml = (state.activeFiles||[]).length ? state.activeFiles.map(f=>
     '<div class="file-row">'+
-    '<a class="file-name" href="'+f.dataUrl+'" target="_blank" rel="noopener" title="View '+escapeAttr(f.name)+'">'+escapeHtml(f.name)+'</a>'+
+    '<a class="file-name" href="#" onclick="viewStoredFileById(\''+f.id+'\'); return false;" title="View '+escapeAttr(f.name)+'">'+escapeHtml(f.name)+'</a>'+
     '<span class="file-size">'+fmtSize(f.size)+'</span>'+
-    '<a class="doc-link-btn" href="'+f.dataUrl+'" download="'+escapeAttr(f.name)+'" title="Download">&darr;</a>'+
+    '<a class="doc-link-btn" href="#" onclick="downloadStoredFileById(\''+f.id+'\'); return false;" title="Download">&darr;</a>'+
     '<button class="item-del" onclick="deleteFile(\''+f.id+'\')">&times;</button>'+
     '</div>'
   ).join('') : '<div style="color:var(--ink-soft); font-size:12.5px; padding:4px 0 0;">No files uploaded yet.</div>';
@@ -1753,6 +1753,45 @@ function readFileAsDataUrl(file){
     reader.onerror = ()=>reject(new Error('read failed'));
     reader.readAsDataURL(file);
   });
+}
+function dataUrlToBlob(dataUrl){
+  const commaIdx = dataUrl.indexOf(',');
+  const meta = dataUrl.slice(0, commaIdx);
+  const body = dataUrl.slice(commaIdx + 1);
+  const mimeMatch = /data:([^;]*)/.exec(meta);
+  const mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+  const isBase64 = meta.indexOf('base64') !== -1;
+  const byteString = isBase64 ? atob(body) : decodeURIComponent(body);
+  const arr = new Uint8Array(byteString.length);
+  for(let i=0;i<byteString.length;i++){ arr[i] = byteString.charCodeAt(i); }
+  return new Blob([arr], {type: mime});
+}
+function findStoredFileById(id){
+  return (state.activeFiles||[]).find(f=>f.id===id) || null;
+}
+function viewStoredFileById(id){
+  const f = findStoredFileById(id); if(!f) return;
+  try{
+    const blob = dataUrlToBlob(f.dataUrl);
+    const url = URL.createObjectURL(blob);
+    window.open(url, '_blank');
+    setTimeout(()=>URL.revokeObjectURL(url), 60000);
+  }catch(e){
+    showToast('Could not open file for preview.');
+  }
+}
+function downloadStoredFileById(id){
+  const f = findStoredFileById(id); if(!f) return;
+  try{
+    const blob = dataUrlToBlob(f.dataUrl);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = f.name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url), 60000);
+  }catch(e){
+    showToast('Could not download file.');
+  }
 }
 async function addPay(){
   const c = getActive(); if(!c) return;
