@@ -673,9 +673,9 @@ async function saveCandidates(){
     return true;
   }catch(e){ showToast('Failed to save. Please try again.'); return false; }
 }
-async function saveCandidateNow(){
+async function saveCandidateNow(ev){
   const c = getActive(); if(!c) return;
-  const btn = event && event.target;
+  const btn = ev && ev.target;
   if(btn){ btn.disabled = true; btn.textContent = 'Saving...'; }
   const ok = await saveCandidates();
   if(btn){ btn.disabled = false; btn.textContent = 'Save changes'; }
@@ -1483,7 +1483,7 @@ function renderDrawer(){
     '<div><h2>'+escapeHtml(c.name)+'</h2><span class="id-tag">'+candidateIdLabel(c)+'</span></div>'+
     '</div>'+
     '<div style="display:flex; align-items:center; gap:8px;">'+
-    '<button class="btn btn-sm btn-primary" onclick="saveCandidateNow()">Save changes</button>'+
+    '<button class="btn btn-sm btn-primary" onclick="saveCandidateNow(event)">Save changes</button>'+
     '<button class="close-x" onclick="closeDrawer()" style="width:auto; padding:6px 12px; font-size:13px;">Close</button>'+
     '</div>'+
     '</div></div>'+
