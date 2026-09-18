@@ -427,6 +427,8 @@
       <input type="file" id="import-file-input" accept=".csv,.xlsx,.xls" style="display:none;" onchange="handleImportFile(event)">
       <button class="btn" id="btn-import" onclick="triggerImportFile()">Import</button>
       <button class="btn" id="btn-export" onclick="exportCSV()">Export</button>
+      <button class="btn" id="btn-backup" onclick="omnaDownloadBackup()" title="Download a complete JSON backup of all data">Backup</button>
+      <button class="btn" id="btn-restore" onclick="omnaRestoreBackup()" title="Restore all data from a JSON backup file">Restore</button>
       <button class="btn btn-primary" id="btn-new-primary" onclick="openAddCandidate()">+ New candidate</button>
     </div>
     <div class="content" id="content">
@@ -450,54 +452,131 @@
 /* --- Shared storage shim: talks to your Apps Script Web App instead of ---
    --- Claude.ai's window.storage API, so data syncs across everyone      --- */
 window.storage = (function(){
-  // Paste the Web App URL from your Apps Script deployment here (ends in /exec).
+  // Apps Script Web App endpoint (ends in /exec).
   var API_URL = 'https://script.google.com/macros/s/AKfycbxySCQCP-aW7HN4lX9hnRyi3bJhVsWUcrboUSFeyILT0mpc9d6xnPpIHeEGGu7CBgPj/exec';
   var PREFIX = 'omna_';
 
-  function cacheGet(key){
-    try { return localStorage.getItem(PREFIX + key); } catch(e){ return null; }
+  /* ---------------------------------------------------------------------
+     DATA-LOSS GUARD
+     A failed read must NEVER be mistaken for "there is no data".
+     Before this guard existed, one dropped connection during a save caused
+     the app to write a near-empty list over the whole register.
+     --------------------------------------------------------------------- */
+  var GUARD = window.OMNA_GUARD = {
+    degraded: false,      // a server read failed at some point this session
+    readOnly: false,      // all writes blocked
+    reason: '',
+    lastGoodCounts: {},   // key -> record count last confirmed by the server
+    allowShrink: false    // set deliberately around bulk deletions / restores
+  };
+
+  function degrade(reason){
+    GUARD.degraded = true;
+    GUARD.readOnly = true;
+    GUARD.reason = reason || 'connection problem';
+    if (typeof window.omnaRenderGuardBanner === 'function') window.omnaRenderGuardBanner();
   }
-  function cacheSet(key, value){
-    try { localStorage.setItem(PREFIX + key, value); } catch(e){}
+  window.omnaDegrade = degrade;
+
+  function cacheGet(key){ try { return localStorage.getItem(PREFIX + key); } catch(e){ return null; } }
+  function cacheSet(key, value){ try { localStorage.setItem(PREFIX + key, value); } catch(e){} }
+  function cacheRemove(key){ try { localStorage.removeItem(PREFIX + key); } catch(e){} }
+  function configured(){ return API_URL.indexOf('PASTE_YOUR') !== 0; }
+
+  function countOf(raw){
+    try { var p = JSON.parse(raw); return Array.isArray(p) ? p.length : null; } catch(e){ return null; }
   }
-  function cacheRemove(key){
-    try { localStorage.removeItem(PREFIX + key); } catch(e){}
-  }
-  function configured(){
-    return API_URL.indexOf('PASTE_YOUR') !== 0;
+
+  // Raw server read: resolves {value} or null, and REJECTS on transport failure.
+  function serverGet(key){
+    return fetch(API_URL + '?key=' + encodeURIComponent(key), {cache:'no-store'})
+      .then(function(r){
+        if (!r.ok) throw new Error('server returned ' + r.status);
+        return r.json();
+      })
+      .then(function(data){
+        if (data && data.error) throw new Error(String(data.error));
+        return (data && data.value != null) ? { value: data.value } : null;
+      });
   }
 
   function remoteGet(key){
     if (!configured()) {
-      var raw = cacheGet(key);
-      return Promise.resolve(raw === null ? null : { value: raw });
+      var raw0 = cacheGet(key);
+      return Promise.resolve(raw0 === null ? null : { value: raw0 });
     }
-    return fetch(API_URL + '?key=' + encodeURIComponent(key))
-      .then(function(r){ return r.json(); })
-      .then(function(data){
-        if (data && data.value != null) { cacheSet(key, data.value); return { value: data.value }; }
-        return null;
+    return serverGet(key)
+      .then(function(res){
+        if (res) {
+          cacheSet(key, res.value);
+          var n = countOf(res.value);
+          if (n !== null) GUARD.lastGoodCounts[key] = n;
+        }
+        return res;
       })
-      .catch(function(){
+      .catch(function(err){
+        // Could not reach the server. Show the local copy, but lock the app
+        // read-only so this stale/empty view can never be written back.
+        degrade('could not read "' + key + '" from the server (' + err.message + ')');
         var raw = cacheGet(key);
         return raw === null ? null : { value: raw };
       });
   }
 
   function remoteSet(key, value){
-    cacheSet(key, value); // optimistic local cache so the UI stays fast/offline-safe
-    if (!configured()) return Promise.resolve(true);
-    return fetch(API_URL, {
-      method: 'POST',
-      body: JSON.stringify({ action: 'set', key: key, value: value })
-    }).then(function(r){ return r.json(); })
-      .then(function(data){
-        if (!data || !data.ok) throw new Error('save failed');
-        return true;
+    if (GUARD.readOnly) {
+      return Promise.reject(new Error('OMNA is in safe mode (' + GUARD.reason + '). Saving is blocked to protect your data — reload the page once your connection is stable.'));
+    }
+    if (!configured()) { cacheSet(key, value); return Promise.resolve(true); }
+
+    // Always confirm what is on the server before overwriting it.
+    return serverGet(key)
+      .catch(function(err){
+        degrade('could not verify "' + key + '" before saving (' + err.message + ')');
+        throw new Error('Save cancelled — the server could not be reached. Nothing was changed.');
+      })
+      .then(function(current){
+        var newCount = countOf(value);
+        var curCount = (current && current.value != null) ? countOf(current.value) : null;
+
+        // Refuse any write that would wipe out a large share of the records.
+        if (!GUARD.allowShrink && curCount !== null && newCount !== null && newCount < curCount) {
+          var lost = curCount - newCount;
+          var bigDrop = (curCount >= 10 && newCount <= 2) || (lost / curCount > 0.2);
+          if (bigDrop) {
+            degrade('a save was blocked: it would have deleted ' + lost + ' of ' + curCount + ' "' + key + '" records');
+            throw new Error('Save blocked — this would have removed ' + lost + ' of ' + curCount + ' records. Nothing was changed.');
+          }
+        }
+
+        // Keep one previous version on the server whenever data shrinks.
+        var backup = Promise.resolve();
+        if (current && current.value != null && curCount !== null && newCount !== null && newCount < curCount) {
+          backup = fetch(API_URL, {
+            method: 'POST',
+            body: JSON.stringify({ action: 'set', key: key + '__prev', value: current.value })
+          }).catch(function(){});
+        }
+
+        return backup.then(function(){
+          return fetch(API_URL, {
+            method: 'POST',
+            body: JSON.stringify({ action: 'set', key: key, value: value })
+          }).then(function(r){ return r.json(); })
+            .then(function(data){
+              if (!data || !data.ok) throw new Error('save failed');
+              cacheSet(key, value);   // cache only AFTER the server confirms
+              if (newCount !== null) GUARD.lastGoodCounts[key] = newCount;
+              return true;
+            });
+        });
       });
   }
 
   function remoteDelete(key){
+    if (GUARD.readOnly) {
+      return Promise.reject(new Error('OMNA is in safe mode (' + GUARD.reason + '). Deleting is blocked.'));
+    }
     cacheRemove(key);
     if (!configured()) return Promise.resolve(true);
     return fetch(API_URL, {
@@ -509,9 +588,115 @@ window.storage = (function(){
   return {
     get: remoteGet,
     set: remoteSet,
-    delete: remoteDelete
+    delete: remoteDelete,
+    _serverGet: serverGet,
+    _api: API_URL,
+    _guard: GUARD
   };
 })();
+
+/* =======================================================================
+   SAFE-MODE BANNER + BACKUP / RESTORE
+   ======================================================================= */
+window.OMNA_DATA_KEYS = ['candidates','partners','documents','corridors','stages',
+  'partnerTypes','documentTypes','customFields','docTemplates','theme'];
+
+window.omnaRenderGuardBanner = function(){
+  var G = window.OMNA_GUARD;
+  var el = document.getElementById('omna-guard-banner');
+  if (!G || !G.degraded) { if (el) el.remove(); return; }
+  if (el) { var m = el.querySelector('.omna-guard-msg'); if (m) m.textContent = G.reason; return; }
+
+  el = document.createElement('div');
+  el.id = 'omna-guard-banner';
+  el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#8B1A1A;color:#fff;' +
+    'padding:10px 16px;font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;' +
+    'box-shadow:0 2px 10px rgba(0,0,0,.35);display:flex;gap:12px;align-items:center;flex-wrap:wrap';
+  el.innerHTML =
+    '<strong style="flex:0 0 auto">⚠ SAFE MODE — saving is disabled</strong>' +
+    '<span class="omna-guard-msg" style="flex:1 1 260px;opacity:.95"></span>' +
+    '<button type="button" id="omna-guard-backup" style="flex:0 0 auto;background:#fff;color:#8B1A1A;border:0;border-radius:6px;padding:6px 12px;font-weight:600;cursor:pointer">Download backup</button>' +
+    '<button type="button" id="omna-guard-retry" style="flex:0 0 auto;background:transparent;color:#fff;border:1px solid rgba(255,255,255,.7);border-radius:6px;padding:6px 12px;cursor:pointer">Reload</button>';
+  document.body.appendChild(el);
+  el.querySelector('.omna-guard-msg').textContent = G.reason;
+  document.getElementById('omna-guard-retry').onclick = function(){ location.reload(); };
+  document.getElementById('omna-guard-backup').onclick = function(){ window.omnaDownloadBackup(); };
+};
+
+// Full JSON backup of everything currently loaded in the browser.
+window.omnaDownloadBackup = function(){
+  var dump = { exportedAt: new Date().toISOString(), source: 'browser-state', data: {} };
+  try {
+    dump.data.candidates    = JSON.stringify(state.candidates || []);
+    dump.data.partners      = JSON.stringify(state.partners || []);
+    dump.data.documents     = JSON.stringify(state.documents || []);
+    dump.data.corridors     = JSON.stringify(state.corridors || []);
+    dump.data.stages        = JSON.stringify(state.stages || []);
+    dump.data.partnerTypes  = JSON.stringify(state.partnerTypes || []);
+    dump.data.documentTypes = JSON.stringify(state.documentTypes || []);
+    dump.data.customFields  = JSON.stringify(state.customFields || []);
+    dump.data.docTemplates  = JSON.stringify(state.docTemplates || {});
+    dump.data.theme         = JSON.stringify(state.theme || {});
+  } catch(e){}
+  // also include whatever is cached locally, which may be richer than state
+  dump.localStorage = {};
+  try {
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (k && k.indexOf('omna_') === 0) dump.localStorage[k] = localStorage.getItem(k);
+    }
+  } catch(e){}
+
+  var blob = new Blob([JSON.stringify(dump, null, 2)], {type:'application/json'});
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'omna-backup-' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'-') + '.json';
+  document.body.appendChild(a); a.click();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+};
+
+// Restore a backup file to the server. Asks for confirmation first.
+window.omnaRestoreBackup = function(){
+  var input = document.createElement('input');
+  input.type = 'file'; input.accept = 'application/json,.json';
+  input.onchange = function(){
+    var f = input.files && input.files[0]; if (!f) return;
+    var reader = new FileReader();
+    reader.onload = async function(){
+      var parsed;
+      try { parsed = JSON.parse(reader.result); }
+      catch(e){ alert('That file is not valid JSON.'); return; }
+      var data = parsed.data || {};
+      if (parsed.localStorage) {
+        Object.keys(parsed.localStorage).forEach(function(lk){
+          var plain = lk.replace(/^omna_/, '');
+          if (data[plain] == null) data[plain] = parsed.localStorage[lk];
+        });
+      }
+      var keys = Object.keys(data).filter(function(k){ return window.OMNA_DATA_KEYS.indexOf(k) !== -1; });
+      var summary = keys.map(function(k){
+        var n; try { var p = JSON.parse(data[k]); n = Array.isArray(p) ? p.length + ' records' : 'settings'; } catch(e){ n = '?'; }
+        return '  • ' + k + ': ' + n;
+      }).join('\n');
+      if (!confirm('Restore this backup to the server?\n\n' + summary + '\n\nThis overwrites what is currently stored.')) return;
+
+      window.OMNA_GUARD.readOnly = false;
+      window.OMNA_GUARD.allowShrink = true;
+      var done = [], failed = [];
+      for (var i = 0; i < keys.length; i++) {
+        try { await window.storage.set(keys[i], data[keys[i]]); done.push(keys[i]); }
+        catch(e){ failed.push(keys[i] + ' (' + e.message + ')'); }
+      }
+      window.OMNA_GUARD.allowShrink = false;
+      alert('Restored: ' + (done.join(', ') || 'nothing') +
+            (failed.length ? '\n\nFailed: ' + failed.join('; ') : '') +
+            '\n\nThe page will now reload.');
+      location.reload();
+    };
+    reader.readAsText(f);
+  };
+  input.click();
+};
 
 const DEFAULT_STAGES = ['Registration','Document Verification','Interview','Visa Submitted','Visa Denial','Visa Approved','Departed','Completed'];
 const DEFAULT_CORRIDORS = ['Turkey','Croatia','Albania','Montenegro','Japan','Brunei Darussalam','Greece'];
@@ -700,9 +885,14 @@ async function importMigratedCandidates2025(){
   if(addedCorridors) await saveCorridors();
 
   const existingIds = new Set(state.candidates.map(c=>c.id));
-  const toAdd = MIGRATED_CANDIDATES_2025.filter(c=>!existingIds.has(c.id));
+  const toAdd = MIGRATED_CANDIDATES_2025.filter(c=>!c.id || !existingIds.has(c.id));
   let nextSeq = state.candidates.reduce((m,c)=>Math.max(m,c.seq||0), 0) + 1;
-  toAdd.forEach(c=>{ c.seq = nextSeq++; });
+  toAdd.forEach(c=>{
+    // Every record MUST carry a unique id: saveCandidates merges by id, and
+    // two id-less records would collide and overwrite each other.
+    if(!c.id) c.id = uid('c');
+    c.seq = nextSeq++;
+  });
   state.candidates = state.candidates.concat(toAdd);
   await saveCandidates();
   try{ await window.storage.set('migrationImported2025', 'true', true); }catch(e){}
@@ -730,10 +920,15 @@ async function saveCandidates(recordOverride){
     // still be open, so the new record can never be silently dropped by the
     // merge-safe save below.
     const active = recordOverride || getActive();
+    if(active && !active.id){ active.id = uid('c'); }
     if(active){
       const latest = await window.storage.get('candidates', true);
       let serverArr = [];
       try{ serverArr = latest && latest.value ? JSON.parse(latest.value) : []; }catch(e2){ serverArr = state.candidates; }
+      // Never let an unreadable/empty server response collapse the register.
+      if ((!latest || !latest.value) && state.candidates.length > 1) {
+        throw new Error('Save cancelled - the server returned no candidate list while ' + state.candidates.length + ' are loaded here. Nothing was changed.');
+      }
       const idx = serverArr.findIndex(x=>x.id === active.id);
       if(idx === -1) serverArr.push(active); else serverArr[idx] = active;
       await window.storage.set('candidates', JSON.stringify(serverArr), true);
@@ -742,7 +937,7 @@ async function saveCandidates(recordOverride){
       await window.storage.set('candidates', JSON.stringify(state.candidates), true);
     }
     return true;
-  }catch(e){ showToast('Failed to save. Please try again.'); return false; }
+  }catch(e){ showToast(e && e.message ? e.message : 'Failed to save. Please try again.'); return false; }
 }
 async function saveCandidateNow(ev){
   const c = getActive(); if(!c) return;
@@ -2920,7 +3115,7 @@ async function submitEnterPassword(){
 function unlockApp(){
   document.getElementById('lock-screen').style.display = 'none';
   document.getElementById('app-root').style.display = 'flex';
-  loadData();
+  loadData().then(function(){ if (window.OMNA_GUARD && window.OMNA_GUARD.degraded) window.omnaRenderGuardBanner(); });
 }
 function openChangePassword(){
   document.getElementById('modal').innerHTML =
