@@ -451,156 +451,253 @@
 <script>
 /* --- Shared storage shim: talks to your Apps Script Web App instead of ---
    --- Claude.ai's window.storage API, so data syncs across everyone      --- */
-window.storage = (function(){
-  // Apps Script Web App endpoint (ends in /exec).
-  var API_URL = 'https://script.google.com/macros/s/AKfycbxySCQCP-aW7HN4lX9hnRyi3bJhVsWUcrboUSFeyILT0mpc9d6xnPpIHeEGGu7CBgPj/exec';
-  var PREFIX = 'omna_';
+/* =======================================================================
+   OMNA data layer — Google Sheet backend, one row per record.
 
-  /* ---------------------------------------------------------------------
-     DATA-LOSS GUARD
-     A failed read must NEVER be mistaken for "there is no data".
-     Before this guard existed, one dropped connection during a save caused
-     the app to write a near-empty list over the whole register.
-     --------------------------------------------------------------------- */
-  var GUARD = window.OMNA_GUARD = {
-    degraded: false,      // a server read failed at some point this session
-    readOnly: false,      // all writes blocked
-    reason: '',
-    lastGoodCounts: {},   // key -> record count last confirmed by the server
-    allowShrink: false    // set deliberately around bulk deletions / restores
-  };
+   Replaces the old key/value blob store. A save now writes exactly one
+   spreadsheet row, so no single failure can affect the other records.
+   ======================================================================= */
+window.OMNA = (function(){
+
+  // ---------------------------------------------------------------------
+  // PASTE THE APPS SCRIPT WEB APP URL HERE (it ends in /exec)
+  // ---------------------------------------------------------------------
+  var API_URL = 'https://script.google.com/macros/s/AKfycbydnEVveZqP5tXBK43cxmseOFcWeXgCB0cOSjtJBRnfcz4bVYGugPEnLmQj9ArxOBNH/exec';
+
+  var token = null;
+  var me = null;   // {email, name, role}
+  var lists = {};
+
+  var GUARD = window.OMNA_GUARD = { degraded: false, readOnly: false, reason: '' };
 
   function degrade(reason){
-    GUARD.degraded = true;
-    GUARD.readOnly = true;
-    GUARD.reason = reason || 'connection problem';
+    GUARD.degraded = true; GUARD.readOnly = true; GUARD.reason = reason || 'connection problem';
     if (typeof window.omnaRenderGuardBanner === 'function') window.omnaRenderGuardBanner();
   }
-  window.omnaDegrade = degrade;
+  function recover(){
+    GUARD.degraded = false; GUARD.readOnly = false; GUARD.reason = '';
+    if (typeof window.omnaRenderGuardBanner === 'function') window.omnaRenderGuardBanner();
+  }
 
-  function cacheGet(key){ try { return localStorage.getItem(PREFIX + key); } catch(e){ return null; } }
-  function cacheSet(key, value){ try { localStorage.setItem(PREFIX + key, value); } catch(e){} }
-  function cacheRemove(key){ try { localStorage.removeItem(PREFIX + key); } catch(e){} }
   function configured(){ return API_URL.indexOf('PASTE_YOUR') !== 0; }
 
-  function countOf(raw){
-    try { var p = JSON.parse(raw); return Array.isArray(p) ? p.length : null; } catch(e){ return null; }
-  }
-
-  // Raw server read: resolves {value} or null, and REJECTS on transport failure.
-  function serverGet(key){
-    return fetch(API_URL + '?key=' + encodeURIComponent(key), {cache:'no-store'})
-      .then(function(r){
-        if (!r.ok) throw new Error('server returned ' + r.status);
-        return r.json();
-      })
-      .then(function(data){
-        if (data && data.error) throw new Error(String(data.error));
-        return (data && data.value != null) ? { value: data.value } : null;
-      });
-  }
-
-  function remoteGet(key){
+  /** Every request goes through here. Failures are loud, never silent. */
+  async function call(action, payload, opts){
     if (!configured()) {
-      var raw0 = cacheGet(key);
-      return Promise.resolve(raw0 === null ? null : { value: raw0 });
+      throw new Error('The backend URL has not been set in index.html yet (API_URL near the top of the script).');
     }
-    return serverGet(key)
-      .then(function(res){
-        if (res) {
-          cacheSet(key, res.value);
-          var n = countOf(res.value);
-          if (n !== null) GUARD.lastGoodCounts[key] = n;
-        }
-        return res;
-      })
-      .catch(function(err){
-        // Could not reach the server. Show the local copy, but lock the app
-        // read-only so this stale/empty view can never be written back.
-        degrade('could not read "' + key + '" from the server (' + err.message + ')');
-        var raw = cacheGet(key);
-        return raw === null ? null : { value: raw };
-      });
+    var body = { action: action };
+    if (payload) Object.keys(payload).forEach(function(k){ body[k] = payload[k]; });
+    if (token && !(opts && opts.noToken)) body.token = token;
+
+    var r;
+    try {
+      // No Content-Type header on purpose: it keeps this a "simple" request
+      // so the browser does not send a CORS preflight, which Apps Script
+      // cannot answer.
+      r = await fetch(API_URL, { method: 'POST', body: JSON.stringify(body) });
+    } catch (e) {
+      degrade('could not reach the server (' + e.message + ')');
+      throw new Error('Could not reach the server. Nothing was changed.');
+    }
+    if (!r.ok) {
+      degrade('the server returned ' + r.status);
+      throw new Error('Server error ' + r.status + '. Nothing was changed.');
+    }
+    var data;
+    try { data = await r.json(); }
+    catch (e) {
+      degrade('the server sent a response the app could not read');
+      throw new Error('Unreadable server response. Nothing was changed.');
+    }
+    if (!data.ok) {
+      var msg = data.error || 'The request failed.';
+      if (/sign in again|expired|Not signed in/i.test(msg)) {
+        token = null; me = null;
+        if (typeof window.omnaForceLogin === 'function') window.omnaForceLogin(msg);
+      }
+      throw new Error(msg);
+    }
+    recover();
+    return data;
   }
 
-  function remoteSet(key, value){
-    if (GUARD.readOnly) {
-      return Promise.reject(new Error('OMNA is in safe mode (' + GUARD.reason + '). Saving is blocked to protect your data — reload the page once your connection is stable.'));
-    }
-    if (!configured()) { cacheSet(key, value); return Promise.resolve(true); }
-
-    // Always confirm what is on the server before overwriting it.
-    return serverGet(key)
-      .catch(function(err){
-        degrade('could not verify "' + key + '" before saving (' + err.message + ')');
-        throw new Error('Save cancelled — the server could not be reached. Nothing was changed.');
-      })
-      .then(function(current){
-        var newCount = countOf(value);
-        var curCount = (current && current.value != null) ? countOf(current.value) : null;
-
-        // Refuse any write that would wipe out a large share of the records.
-        if (!GUARD.allowShrink && curCount !== null && newCount !== null && newCount < curCount) {
-          var lost = curCount - newCount;
-          var bigDrop = (curCount >= 10 && newCount <= 2) || (lost / curCount > 0.2);
-          if (bigDrop) {
-            degrade('a save was blocked: it would have deleted ' + lost + ' of ' + curCount + ' "' + key + '" records');
-            throw new Error('Save blocked — this would have removed ' + lost + ' of ' + curCount + ' records. Nothing was changed.');
-          }
-        }
-
-        // Keep one previous version on the server whenever data shrinks.
-        var backup = Promise.resolve();
-        if (current && current.value != null && curCount !== null && newCount !== null && newCount < curCount) {
-          backup = fetch(API_URL, {
-            method: 'POST',
-            body: JSON.stringify({ action: 'set', key: key + '__prev', value: current.value })
-          }).catch(function(){});
-        }
-
-        return backup.then(function(){
-          return fetch(API_URL, {
-            method: 'POST',
-            body: JSON.stringify({ action: 'set', key: key, value: value })
-          }).then(function(r){ return r.json(); })
-            .then(function(data){
-              if (!data || !data.ok) throw new Error('save failed');
-              cacheSet(key, value);   // cache only AFTER the server confirms
-              if (newCount !== null) GUARD.lastGoodCounts[key] = newCount;
-              return true;
-            });
-        });
-      });
+  // --- session --------------------------------------------------------
+  async function login(email, password){
+    var d = await call('login', { email: email, password: password }, { noToken: true });
+    token = d.token; me = d.user;
+    try { sessionStorage.setItem('omna_token', token); sessionStorage.setItem('omna_user', JSON.stringify(me)); } catch(e){}
+    return me;
   }
 
-  function remoteDelete(key){
-    if (GUARD.readOnly) {
-      return Promise.reject(new Error('OMNA is in safe mode (' + GUARD.reason + '). Deleting is blocked.'));
-    }
-    cacheRemove(key);
-    if (!configured()) return Promise.resolve(true);
-    return fetch(API_URL, {
-      method: 'POST',
-      body: JSON.stringify({ action: 'delete', key: key })
-    }).then(function(r){ return r.json(); });
+  function restoreSession(){
+    try {
+      var t = sessionStorage.getItem('omna_token');
+      var u = sessionStorage.getItem('omna_user');
+      if (t && u) { token = t; me = JSON.parse(u); return true; }
+    } catch(e){}
+    return false;
   }
+
+  function signOut(){
+    token = null; me = null;
+    try { sessionStorage.removeItem('omna_token'); sessionStorage.removeItem('omna_user'); } catch(e){}
+  }
+
+  function user(){ return me; }
+  function role(){ return me ? me.role : null; }
+  function canEdit(){ return me && (me.role === 'editor' || me.role === 'admin'); }
+  function isAdmin(){ return me && me.role === 'admin'; }
+
+  /** Blocks an edit attempt by a view-only account before it leaves the browser. */
+  function requireEdit(){
+    if (!canEdit()) throw new Error('Your account has view-only access, so nothing was changed.');
+  }
+
+  async function changePassword(current, next){
+    return call('changePassword', { currentPassword: current, newPassword: next });
+  }
+
+  // --- data -----------------------------------------------------------
+  async function bootstrap(){
+    var d = await call('bootstrap', {});
+    lists = d.lists || {};
+    if (d.user) me = { email: d.user.email, name: (me && me.name) || d.user.email, role: d.user.role };
+    return d;
+  }
+
+  var KIND = { candidate: 'Candidate', partner: 'Partner', docRecord: 'DocRecord' };
+
+  async function upsert(kind, record){
+    requireEdit();
+    if (!record || !record.id) throw new Error('This record has no id, so it was not saved.');
+    return call('upsert' + KIND[kind], { record: record });
+  }
+
+  async function remove(kind, id){
+    requireEdit();
+    return call('delete' + KIND[kind], { id: id });
+  }
+
+  async function setList(name, value){
+    requireEdit();
+    lists[name] = value;
+    return call('setList', { name: name, value: value });
+  }
+
+  function cachedList(name){ return lists[name]; }
+
+  async function importAll(payload){
+    if (!isAdmin()) throw new Error('Only an admin account can import data.');
+    return call('importAll', { payload: payload });
+  }
+
+  // --- attachments ----------------------------------------------------
+  var files = {
+    /** Metadata only — small and fast. dataUrl is fetched on demand. */
+    list: async function(ownerKey){
+      var d = await call('listFiles', { ownerKey: ownerKey });
+      return d.files || [];
+    },
+    /** Full file including dataUrl. */
+    get: async function(fileId){
+      var d = await call('getFile', { fileId: fileId });
+      return d.file;
+    },
+    put: async function(ownerKey, ownerName, file){
+      requireEdit();
+      var d = await call('putFile', { ownerKey: ownerKey, ownerName: ownerName, file: file });
+      return d.file;
+    },
+    del: async function(fileId){
+      requireEdit();
+      return call('deleteFile', { fileId: fileId });
+    },
+    /** Removes every attachment belonging to one owner. */
+    delAllFor: async function(ownerKey){
+      requireEdit();
+      var existing = await files.list(ownerKey);
+      for (var i = 0; i < existing.length; i++) {
+        try { await files.del(existing[i].id); } catch(e){}
+      }
+    }
+  };
 
   return {
-    get: remoteGet,
-    set: remoteSet,
-    delete: remoteDelete,
-    _serverGet: serverGet,
-    _api: API_URL,
-    _guard: GUARD
+    login: login, restoreSession: restoreSession, signOut: signOut,
+    user: user, role: role, canEdit: canEdit, isAdmin: isAdmin, requireEdit: requireEdit,
+    changePassword: changePassword,
+    bootstrap: bootstrap, upsert: upsert, remove: remove,
+    setList: setList, cachedList: cachedList, importAll: importAll,
+    files: files,
+    configured: configured, guard: GUARD, degrade: degrade,
+    _call: call
+  };
+})();
+
+/* -----------------------------------------------------------------------
+   Compatibility layer.
+   The app has ~50 `window.storage.get(...)` call sites. Rather than rewrite
+   each one, reads are served from the in-memory snapshot that bootstrap()
+   fills. Writes that used to overwrite a whole blob are rejected loudly —
+   every real save now goes through OMNA.upsert / OMNA.setList.
+   ----------------------------------------------------------------------- */
+window.storage = (function(){
+  var LIST_KEYS = ['corridors','stages','partnerTypes','documentTypes','customFields','docTemplates','theme'];
+  var BLOB_KEYS = ['candidates','partners','documents'];
+
+  function wrap(v){ return v === null || v === undefined ? null : { value: JSON.stringify(v) }; }
+
+  return {
+    get: function(key){
+      if (key === 'candidates') return Promise.resolve(wrap(state.candidates));
+      if (key === 'partners')   return Promise.resolve(wrap(state.partners));
+      if (key === 'documents')  return Promise.resolve(wrap(state.documents));
+      if (LIST_KEYS.indexOf(key) !== -1) {
+        var v = window.OMNA.cachedList(key);
+        return Promise.resolve(v === undefined || v === null ? null : wrap(v));
+      }
+      // The migration banners belong to the old blob store; the data is now
+      // imported directly into the spreadsheet.
+      if (key === 'migrationImported' || key === 'migrationImported2025') {
+        return Promise.resolve({ value: 'true' });
+      }
+      // Replaced by per-user accounts.
+      if (key === 'accessPasswordHash') return Promise.resolve(null);
+      return Promise.resolve(null);
+    },
+
+    set: function(key, value){
+      if (LIST_KEYS.indexOf(key) !== -1) {
+        var parsed;
+        try { parsed = JSON.parse(value); } catch(e){ parsed = value; }
+        return window.OMNA.setList(key, parsed);
+      }
+      if (key === 'migrationImported' || key === 'migrationImported2025') return Promise.resolve(true);
+      if (key === 'accessPasswordHash') return Promise.resolve(true);
+      if (BLOB_KEYS.indexOf(key) !== -1) {
+        return Promise.reject(new Error(
+          'Internal error: an old whole-list save was attempted for "' + key +
+          '". Records are now saved one at a time; nothing was changed.'));
+      }
+      if (key.indexOf('files:') === 0) {
+        return Promise.reject(new Error('Internal error: attachments are now saved individually.'));
+      }
+      return Promise.resolve(true);
+    },
+
+    delete: function(key){
+      if (key.indexOf('files:') === 0) {
+        return window.OMNA.files.delAllFor(key.substring('files:'.length));
+      }
+      return Promise.resolve(true);
+    }
   };
 })();
 
 /* =======================================================================
-   SAFE-MODE BANNER + BACKUP / RESTORE
+   Safe-mode banner, backup and restore
    ======================================================================= */
-window.OMNA_DATA_KEYS = ['candidates','partners','documents','corridors','stages',
-  'partnerTypes','documentTypes','customFields','docTemplates','theme'];
-
 window.omnaRenderGuardBanner = function(){
   var G = window.OMNA_GUARD;
   var el = document.getElementById('omna-guard-banner');
@@ -613,7 +710,7 @@ window.omnaRenderGuardBanner = function(){
     'padding:10px 16px;font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;' +
     'box-shadow:0 2px 10px rgba(0,0,0,.35);display:flex;gap:12px;align-items:center;flex-wrap:wrap';
   el.innerHTML =
-    '<strong style="flex:0 0 auto">⚠ SAFE MODE — saving is disabled</strong>' +
+    '<strong style="flex:0 0 auto">⚠ CONNECTION PROBLEM</strong>' +
     '<span class="omna-guard-msg" style="flex:1 1 260px;opacity:.95"></span>' +
     '<button type="button" id="omna-guard-backup" style="flex:0 0 auto;background:#fff;color:#8B1A1A;border:0;border-radius:6px;padding:6px 12px;font-weight:600;cursor:pointer">Download backup</button>' +
     '<button type="button" id="omna-guard-retry" style="flex:0 0 auto;background:transparent;color:#fff;border:1px solid rgba(255,255,255,.7);border-radius:6px;padding:6px 12px;cursor:pointer">Reload</button>';
@@ -623,40 +720,37 @@ window.omnaRenderGuardBanner = function(){
   document.getElementById('omna-guard-backup').onclick = function(){ window.omnaDownloadBackup(); };
 };
 
-// Full JSON backup of everything currently loaded in the browser.
+/** Full JSON backup of everything currently loaded. */
 window.omnaDownloadBackup = function(){
-  var dump = { exportedAt: new Date().toISOString(), source: 'browser-state', data: {} };
-  try {
-    dump.data.candidates    = JSON.stringify(state.candidates || []);
-    dump.data.partners      = JSON.stringify(state.partners || []);
-    dump.data.documents     = JSON.stringify(state.documents || []);
-    dump.data.corridors     = JSON.stringify(state.corridors || []);
-    dump.data.stages        = JSON.stringify(state.stages || []);
-    dump.data.partnerTypes  = JSON.stringify(state.partnerTypes || []);
-    dump.data.documentTypes = JSON.stringify(state.documentTypes || []);
-    dump.data.customFields  = JSON.stringify(state.customFields || []);
-    dump.data.docTemplates  = JSON.stringify(state.docTemplates || {});
-    dump.data.theme         = JSON.stringify(state.theme || {});
-  } catch(e){}
-  // also include whatever is cached locally, which may be richer than state
-  dump.localStorage = {};
-  try {
-    for (var i = 0; i < localStorage.length; i++) {
-      var k = localStorage.key(i);
-      if (k && k.indexOf('omna_') === 0) dump.localStorage[k] = localStorage.getItem(k);
+  var dump = {
+    exportedAt: new Date().toISOString(),
+    exportedBy: (window.OMNA.user() || {}).email || '',
+    source: 'omna-app',
+    data: {
+      candidates: JSON.stringify(state.candidates || []),
+      partners:   JSON.stringify(state.partners || []),
+      documents:  JSON.stringify(state.documents || []),
+      corridors:  JSON.stringify(state.corridors || []),
+      stages:     JSON.stringify(state.stages || []),
+      partnerTypes:  JSON.stringify(state.partnerTypes || []),
+      documentTypes: JSON.stringify(state.documentTypes || []),
+      customFields:  JSON.stringify(state.customFields || []),
+      docTemplates:  JSON.stringify(state.docTemplates || {}),
+      theme:         JSON.stringify(state.theme || {})
     }
-  } catch(e){}
-
+  };
   var blob = new Blob([JSON.stringify(dump, null, 2)], {type:'application/json'});
   var a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = 'omna-backup-' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'-') + '.json';
   document.body.appendChild(a); a.click();
   setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  showToast('Backup downloaded.');
 };
 
-// Restore a backup file to the server. Asks for confirmation first.
+/** Restores a backup file into the spreadsheet. Admin only. */
 window.omnaRestoreBackup = function(){
+  if (!window.OMNA.isAdmin()) { showToast('Only an admin account can restore a backup.'); return; }
   var input = document.createElement('input');
   input.type = 'file'; input.accept = 'application/json,.json';
   input.onchange = function(){
@@ -666,32 +760,39 @@ window.omnaRestoreBackup = function(){
       var parsed;
       try { parsed = JSON.parse(reader.result); }
       catch(e){ alert('That file is not valid JSON.'); return; }
-      var data = parsed.data || {};
-      if (parsed.localStorage) {
-        Object.keys(parsed.localStorage).forEach(function(lk){
-          var plain = lk.replace(/^omna_/, '');
-          if (data[plain] == null) data[plain] = parsed.localStorage[lk];
-        });
-      }
-      var keys = Object.keys(data).filter(function(k){ return window.OMNA_DATA_KEYS.indexOf(k) !== -1; });
-      var summary = keys.map(function(k){
-        var n; try { var p = JSON.parse(data[k]); n = Array.isArray(p) ? p.length + ' records' : 'settings'; } catch(e){ n = '?'; }
-        return '  • ' + k + ': ' + n;
-      }).join('\n');
-      if (!confirm('Restore this backup to the server?\n\n' + summary + '\n\nThis overwrites what is currently stored.')) return;
 
-      window.OMNA_GUARD.readOnly = false;
-      window.OMNA_GUARD.allowShrink = true;
-      var done = [], failed = [];
-      for (var i = 0; i < keys.length; i++) {
-        try { await window.storage.set(keys[i], data[keys[i]]); done.push(keys[i]); }
-        catch(e){ failed.push(keys[i] + ' (' + e.message + ')'); }
+      var src = parsed.data || {};
+      function arr(k){ try { var p = JSON.parse(src[k]); return Array.isArray(p) ? p : null; } catch(e){ return null; } }
+      function obj(k){ try { return JSON.parse(src[k]); } catch(e){ return null; } }
+
+      var payload = { lists: {} };
+      var cands = arr('candidates'); if (cands) payload.candidates = cands;
+      var ptrs  = arr('partners');   if (ptrs)  payload.partners   = ptrs;
+      var docs  = arr('documents');  if (docs)  payload.documents  = docs;
+      ['corridors','stages','partnerTypes','documentTypes','customFields'].forEach(function(k){
+        var v = arr(k); if (v) payload.lists[k] = v;
+      });
+      ['docTemplates','theme'].forEach(function(k){
+        var v = obj(k); if (v) payload.lists[k] = v;
+      });
+
+      var summary =
+        '  • candidates: ' + (payload.candidates ? payload.candidates.length : 'unchanged') + '\n' +
+        '  • partners: '   + (payload.partners   ? payload.partners.length   : 'unchanged') + '\n' +
+        '  • documents: '  + (payload.documents  ? payload.documents.length  : 'unchanged') + '\n' +
+        '  • lists: '      + Object.keys(payload.lists).length;
+
+      if (!confirm('Import this backup into the spreadsheet?\n\n' + summary +
+                   '\n\nThis REPLACES the current contents of those tabs.\n' +
+                   'Google Sheets version history lets you undo it if needed.')) return;
+
+      try {
+        var res = await window.OMNA.importAll(payload);
+        alert('Imported: ' + JSON.stringify(res.imported) + '\n\nThe page will now reload.');
+        location.reload();
+      } catch(e) {
+        alert('Import failed: ' + (e.message || e));
       }
-      window.OMNA_GUARD.allowShrink = false;
-      alert('Restored: ' + (done.join(', ') || 'nothing') +
-            (failed.length ? '\n\nFailed: ' + failed.join('; ') : '') +
-            '\n\nThe page will now reload.');
-      location.reload();
     };
     reader.readAsText(f);
   };
@@ -795,61 +896,45 @@ function showToast(msg){
 }
 
 async function loadData(){
-  try{
-    const c = await window.storage.get('candidates', true);
-    state.candidates = c ? JSON.parse(c.value) : [];
-  }catch(e){ state.candidates = []; }
-  try{
-    const cor = await window.storage.get('corridors', true);
-    state.corridors = cor ? JSON.parse(cor.value) : [...DEFAULT_CORRIDORS];
-  }catch(e){ state.corridors = [...DEFAULT_CORRIDORS]; }
-  try{
-    const st = await window.storage.get('stages', true);
-    state.stages = st ? JSON.parse(st.value) : [...DEFAULT_STAGES];
-  }catch(e){ state.stages = [...DEFAULT_STAGES]; }
+  let boot;
+  try {
+    boot = await OMNA.bootstrap();
+  } catch(e) {
+    OMNA.degrade(e.message || 'could not load data');
+    omnaRenderGuardBanner();
+    document.getElementById('content').innerHTML =
+      '<div class="panel" style="padding:18px"><strong>Could not load the register.</strong><br>' +
+      escapeHtml(e.message || '') + '</div>';
+    return;
+  }
+
+  state.candidates = boot.candidates || [];
+  state.partners   = boot.partners || [];
+  state.documents  = boot.documents || [];
+
+  const L = boot.lists || {};
+  const pick = (v, dflt) => (Array.isArray(v) && v.length) ? v : [...dflt];
+  state.corridors     = pick(L.corridors,     DEFAULT_CORRIDORS);
+  state.stages        = pick(L.stages,        DEFAULT_STAGES);
+  state.partnerTypes  = pick(L.partnerTypes,  DEFAULT_PARTNER_TYPES);
+  state.documentTypes = pick(L.documentTypes, DEFAULT_DOCUMENT_TYPES);
+  state.customFields  = Array.isArray(L.customFields) ? L.customFields : [...DEFAULT_CUSTOM_FIELDS];
+  state.docTemplates  = (L.docTemplates && typeof L.docTemplates === 'object') ? L.docTemplates : {};
+  state.theme         = (L.theme && L.theme.deep) ? L.theme : {...DEFAULT_THEME};
+
   if(!state.stages.includes('Visa Denial')){
     const submittedIdx = state.stages.indexOf('Visa Submitted');
     if(submittedIdx === -1) state.stages.push('Visa Denial');
     else state.stages.splice(submittedIdx + 1, 0, 'Visa Denial');
-    try{ await saveStages(); }catch(e){}
+    if (OMNA.canEdit()) { try{ await saveStages(); }catch(e){} }
   }
-  try{
-    const dt = await window.storage.get('docTemplates', true);
-    state.docTemplates = dt ? JSON.parse(dt.value) : {};
-  }catch(e){ state.docTemplates = {}; }
-  try{
-    const cf = await window.storage.get('customFields', true);
-    state.customFields = cf ? JSON.parse(cf.value) : [...DEFAULT_CUSTOM_FIELDS];
-  }catch(e){ state.customFields = [...DEFAULT_CUSTOM_FIELDS]; }
-  try{
-    const th = await window.storage.get('theme', true);
-    state.theme = th ? JSON.parse(th.value) : {...DEFAULT_THEME};
-  }catch(e){ state.theme = {...DEFAULT_THEME}; }
+
   applyTheme();
-  try{
-    const mig = await window.storage.get('migrationImported', true);
-    state.showImportBanner = !(mig && mig.value === 'true');
-  }catch(e){ state.showImportBanner = true; }
-  try{
-    const mig2 = await window.storage.get('migrationImported2025', true);
-    state.showImportBanner2025 = !(mig2 && mig2.value === 'true');
-  }catch(e){ state.showImportBanner2025 = true; }
-  try{
-    const pt = await window.storage.get('partners', true);
-    state.partners = pt ? JSON.parse(pt.value) : [];
-  }catch(e){ state.partners = []; }
-  try{
-    const ptt = await window.storage.get('partnerTypes', true);
-    state.partnerTypes = ptt ? JSON.parse(ptt.value) : [...DEFAULT_PARTNER_TYPES];
-  }catch(e){ state.partnerTypes = [...DEFAULT_PARTNER_TYPES]; }
-  try{
-    const dc = await window.storage.get('documents', true);
-    state.documents = dc ? JSON.parse(dc.value) : [];
-  }catch(e){ state.documents = []; }
-  try{
-    const dtt = await window.storage.get('documentTypes', true);
-    state.documentTypes = dtt ? JSON.parse(dtt.value) : [...DEFAULT_DOCUMENT_TYPES];
-  }catch(e){ state.documentTypes = [...DEFAULT_DOCUMENT_TYPES]; }
+  // The old migration banners belonged to the retired blob store.
+  state.showImportBanner = false;
+  state.showImportBanner2025 = false;
+
+  omnaRenderIdentityBar();
   render();
 }
 async function importMigratedCandidates(){
@@ -915,27 +1000,13 @@ function renderImportBanner2025(){
 }
 async function saveCandidates(recordOverride){
   try{
-    // recordOverride lets a caller (e.g. adding a brand-new candidate) target
-    // that specific record even if some OTHER candidate's drawer happens to
-    // still be open, so the new record can never be silently dropped by the
-    // merge-safe save below.
     const active = recordOverride || getActive();
-    if(active && !active.id){ active.id = uid('c'); }
-    if(active){
-      const latest = await window.storage.get('candidates', true);
-      let serverArr = [];
-      try{ serverArr = latest && latest.value ? JSON.parse(latest.value) : []; }catch(e2){ serverArr = state.candidates; }
-      // Never let an unreadable/empty server response collapse the register.
-      if ((!latest || !latest.value) && state.candidates.length > 1) {
-        throw new Error('Save cancelled - the server returned no candidate list while ' + state.candidates.length + ' are loaded here. Nothing was changed.');
-      }
-      const idx = serverArr.findIndex(x=>x.id === active.id);
-      if(idx === -1) serverArr.push(active); else serverArr[idx] = active;
-      await window.storage.set('candidates', JSON.stringify(serverArr), true);
-      state.candidates = serverArr;
-    } else {
-      await window.storage.set('candidates', JSON.stringify(state.candidates), true);
-    }
+    if(!active) return true;                 // nothing specific open to save
+    if(!active.id) active.id = uid('c');
+    if(!active.seq) active.seq = state.candidates.reduce((m,c)=>Math.max(m, c.seq||0), 0) + 1;
+    await OMNA.upsert('candidate', active);  // writes ONE spreadsheet row
+    const idx = state.candidates.findIndex(x => x.id === active.id);
+    if(idx === -1) state.candidates.push(active); else state.candidates[idx] = active;
     return true;
   }catch(e){ showToast(e && e.message ? e.message : 'Failed to save. Please try again.'); return false; }
 }
@@ -1975,20 +2046,46 @@ function closeDrawer(){
   state.activeCandidateId = null;
   state.activeFiles = [];
 }
+/* Attachments live in Drive. The app loads only metadata when a drawer opens
+   (fast), and fetches a file's contents on demand for preview or download. */
+async function omnaHydrateFile(fileId){
+  const f = (state.activeFiles||[]).find(x=>x.id===fileId);
+  if(!f) return null;
+  if(f.dataUrl) return f;
+  try{
+    const full = await OMNA.files.get(fileId);
+    if(full){ f.dataUrl = full.dataUrl; f.type = full.type || f.type; f.size = full.size || f.size; }
+  }catch(e){ showToast(e && e.message ? e.message : 'Could not load the file.'); return null; }
+  return f;
+}
+/* Pushes local changes for one owner: new files up, removed files deleted. */
+async function omnaSyncFiles(ownerKey, ownerName){
+  try{
+    const server = await OMNA.files.list(ownerKey);
+    const serverIds = new Set(server.map(f=>f.id));
+    const localIds  = new Set((state.activeFiles||[]).map(f=>f.id));
+    for(const f of (state.activeFiles||[])){
+      if(!serverIds.has(f.id) && f.dataUrl){
+        const saved = await OMNA.files.put(ownerKey, ownerName, f);
+        if(saved){ f.size = saved.size; f.uploadedAt = saved.uploadedAt; }
+      }
+    }
+    for(const f of server){ if(!localIds.has(f.id)) await OMNA.files.del(f.id); }
+    return true;
+  }catch(e){ showToast(e && e.message ? e.message : 'Failed to save file.'); return false; }
+}
 async function loadFilesForActive(id){
   try{
-    const r = await window.storage.get('files:'+id, true);
-    state.activeFiles = r ? JSON.parse(r.value) : [];
+    state.activeFiles = await OMNA.files.list(id);
+    const c = state.candidates.find(x=>x.id===id);
+    if(c && c.photoFileId) await omnaHydrateFile(c.photoFileId);
   }catch(e){
     state.activeFiles = [];
   }
 }
 async function saveActiveFiles(){
-  try{
-    await window.storage.set('files:'+state.activeCandidateId, JSON.stringify(state.activeFiles), true);
-  }catch(e){
-    showToast('Failed to save file. Please try again.');
-  }
+  const c = getActive();
+  return omnaSyncFiles(state.activeCandidateId, c ? c.name : '');
 }
 function fmtSize(bytes){
   if(!bytes) return '';
@@ -2418,8 +2515,9 @@ function dataUrlToBlob(dataUrl){
 function findStoredFileById(id){
   return (state.activeFiles||[]).find(f=>f.id===id) || null;
 }
-function viewStoredFileById(id){
-  const f = findStoredFileById(id); if(!f) return;
+async function viewStoredFileById(id){
+  let f = findStoredFileById(id); if(!f) return;
+  f = await omnaHydrateFile(id); if(!f || !f.dataUrl) return;
   const isImage = (f.type||'').indexOf('image/') === 0;
   const isPdf = f.type === 'application/pdf';
   if(!isImage && !isPdf){
@@ -2445,8 +2543,9 @@ function viewStoredFileById(id){
     '</div>';
   document.getElementById('modal-overlay').classList.add('open');
 }
-function downloadStoredFileById(id){
-  const f = findStoredFileById(id); if(!f) return;
+async function downloadStoredFileById(id){
+  let f = findStoredFileById(id); if(!f) return;
+  f = await omnaHydrateFile(id); if(!f || !f.dataUrl) return;
   try{
     const blob = dataUrlToBlob(f.dataUrl);
     const url = URL.createObjectURL(blob);
@@ -2536,15 +2635,17 @@ function addNote(){
   saveCandidates();
   renderDrawer();
 }
-function deleteCandidate(){
+async function deleteCandidate(){
   const c = getActive(); if(!c) return;
-  if(!confirm('Delete candidate "'+c.name+'"? This action cannot be undone.')) return;
-  state.candidates = state.candidates.filter(x=>x.id!==c.id);
-  saveCandidates();
-  try{ window.storage.delete('files:'+c.id, true); }catch(e){}
-  closeDrawer();
-  render();
-  showToast('Candidate deleted.');
+  if(!confirm('Delete candidate "'+c.name+'"?\n\nThe row is removed from the spreadsheet and the files go to Drive\'s trash. Sheets version history can still recover it.')) return;
+  try{
+    await OMNA.remove('candidate', c.id);
+    try{ await OMNA.files.delAllFor(c.id); }catch(e){}
+    state.candidates = state.candidates.filter(x=>x.id!==c.id);
+    closeDrawer();
+    render();
+    showToast('Candidate deleted.');
+  }catch(e){ showToast(e && e.message ? e.message : 'Could not delete the candidate.'); }
 }
 
 /* ---------- Partners ---------- */
@@ -2554,19 +2655,13 @@ function getActivePartner(){
 async function savePartners(recordOverride){
   try{
     const active = recordOverride || getActivePartner();
-    if(active){
-      const latest = await window.storage.get('partners', true);
-      let serverArr = [];
-      try{ serverArr = latest && latest.value ? JSON.parse(latest.value) : []; }catch(e2){ serverArr = state.partners; }
-      const idx = serverArr.findIndex(x=>x.id === active.id);
-      if(idx === -1) serverArr.push(active); else serverArr[idx] = active;
-      await window.storage.set('partners', JSON.stringify(serverArr), true);
-      state.partners = serverArr;
-    } else {
-      await window.storage.set('partners', JSON.stringify(state.partners), true);
-    }
+    if(!active) return true;                 // nothing specific open to save
+    if(!active.id) active.id = uid('p');
+    await OMNA.upsert('partner', active);
+    const idx = state.partners.findIndex(x => x.id === active.id);
+    if(idx === -1) state.partners.push(active); else state.partners[idx] = active;
     return true;
-  }catch(e){ showToast('Failed to save partner. Please try again.'); return false; }
+  }catch(e){ showToast(e && e.message ? e.message : 'Failed to save partner.'); return false; }
 }
 async function savePartnerNow(ev){
   const p = getActivePartner(); if(!p) return;
@@ -2629,7 +2724,7 @@ async function submitAddPartner(){
     try{
       const dataUrl = await readFileAsDataUrl(file);
       const newFile = { id: uid('f'), name: file.name, size: file.size, type: file.type, dataUrl, uploadedAt: new Date().toISOString().slice(0,10) };
-      await window.storage.set('files:partner:'+p.id, JSON.stringify([newFile]), true);
+      await OMNA.files.put('partner:'+p.id, p.name, newFile);
       p.agreements.push({id:uid('agr'), title: agrTitle || 'Agreement', signedDate:null, expiryDate:null, fileId:newFile.id});
     }catch(e){ showToast('Could not attach the file, but the partner was saved.'); }
   }
@@ -2653,19 +2748,12 @@ function closePartnerDrawer(){
   state.activeFiles = [];
 }
 async function loadFilesForActivePartner(id){
-  try{
-    const r = await window.storage.get('files:partner:'+id, true);
-    state.activeFiles = r ? JSON.parse(r.value) : [];
-  }catch(e){
-    state.activeFiles = [];
-  }
+  try{ state.activeFiles = await OMNA.files.list('partner:'+id); }
+  catch(e){ state.activeFiles = []; }
 }
 async function saveActivePartnerFiles(){
-  try{
-    await window.storage.set('files:partner:'+state.activePartnerId, JSON.stringify(state.activeFiles), true);
-  }catch(e){
-    showToast('Failed to save file. Please try again.');
-  }
+  const p = getActivePartner();
+  return omnaSyncFiles('partner:'+state.activePartnerId, p ? p.name : '');
 }
 function updatePartnerField(field, value){
   const p = getActivePartner(); if(!p) return;
@@ -2737,15 +2825,17 @@ function deleteAgreement(id){
   savePartners();
   renderPartnerDrawer();
 }
-function deletePartner(){
+async function deletePartner(){
   const p = getActivePartner(); if(!p) return;
-  if(!confirm('Delete partner "'+p.name+'"? This action cannot be undone.')) return;
-  state.partners = state.partners.filter(x=>x.id!==p.id);
-  savePartners();
-  try{ window.storage.delete('files:partner:'+p.id, true); }catch(e){}
-  closePartnerDrawer();
-  render();
-  showToast('Partner deleted.');
+  if(!confirm('Delete partner "'+p.name+'"?')) return;
+  try{
+    await OMNA.remove('partner', p.id);
+    try{ await OMNA.files.delAllFor('partner:'+p.id); }catch(e){}
+    state.partners = state.partners.filter(x=>x.id!==p.id);
+    closePartnerDrawer();
+    render();
+    showToast('Partner deleted.');
+  }catch(e){ showToast(e && e.message ? e.message : 'Could not delete the partner.'); }
 }
 function renderPartnerDrawer(){
   const p = getActivePartner();
@@ -2837,19 +2927,13 @@ function getActiveDocRecord(){
 async function saveDocuments(recordOverride){
   try{
     const active = recordOverride || getActiveDocRecord();
-    if(active){
-      const latest = await window.storage.get('documents', true);
-      let serverArr = [];
-      try{ serverArr = latest && latest.value ? JSON.parse(latest.value) : []; }catch(e2){ serverArr = state.documents; }
-      const idx = serverArr.findIndex(x=>x.id === active.id);
-      if(idx === -1) serverArr.push(active); else serverArr[idx] = active;
-      await window.storage.set('documents', JSON.stringify(serverArr), true);
-      state.documents = serverArr;
-    } else {
-      await window.storage.set('documents', JSON.stringify(state.documents), true);
-    }
+    if(!active) return true;                 // nothing specific open to save
+    if(!active.id) active.id = uid('d');
+    await OMNA.upsert('docRecord', active);
+    const idx = state.documents.findIndex(x => x.id === active.id);
+    if(idx === -1) state.documents.push(active); else state.documents[idx] = active;
     return true;
-  }catch(e){ showToast('Failed to save document. Please try again.'); return false; }
+  }catch(e){ showToast(e && e.message ? e.message : 'Failed to save document.'); return false; }
 }
 async function saveDocRecordNow(ev){
   const d = getActiveDocRecord(); if(!d) return;
@@ -2903,7 +2987,7 @@ async function submitAddDocRecord(){
     try{
       const dataUrl = await readFileAsDataUrl(file);
       const newFile = { id: uid('f'), name: file.name, size: file.size, type: file.type, dataUrl, uploadedAt: new Date().toISOString().slice(0,10) };
-      await window.storage.set('files:docrecord:'+d.id, JSON.stringify([newFile]), true);
+      await OMNA.files.put('docrecord:'+d.id, (d.title||d.type), newFile);
       d.fileId = newFile.id;
     }catch(e){ showToast('Could not attach the file, but the document was saved.'); }
   }
@@ -2927,19 +3011,12 @@ function closeDocRecordDrawer(){
   state.activeFiles = [];
 }
 async function loadFilesForActiveDocRecord(id){
-  try{
-    const r = await window.storage.get('files:docrecord:'+id, true);
-    state.activeFiles = r ? JSON.parse(r.value) : [];
-  }catch(e){
-    state.activeFiles = [];
-  }
+  try{ state.activeFiles = await OMNA.files.list('docrecord:'+id); }
+  catch(e){ state.activeFiles = []; }
 }
 async function saveActiveDocRecordFiles(){
-  try{
-    await window.storage.set('files:docrecord:'+state.activeDocumentId, JSON.stringify(state.activeFiles), true);
-  }catch(e){
-    showToast('Failed to save file. Please try again.');
-  }
+  const d = getActiveDocRecord();
+  return omnaSyncFiles('docrecord:'+state.activeDocumentId, d ? (d.title||d.type) : '');
 }
 function updateDocRecordField(field, value){
   const d = getActiveDocRecord(); if(!d) return;
@@ -2977,15 +3054,17 @@ function removeDocRecordFile(){
   saveDocuments();
   renderDocRecordDrawer();
 }
-function deleteDocRecord(){
+async function deleteDocRecord(){
   const d = getActiveDocRecord(); if(!d) return;
-  if(!confirm('Delete document "'+(d.title||d.type)+'"? This action cannot be undone.')) return;
-  state.documents = state.documents.filter(x=>x.id!==d.id);
-  saveDocuments();
-  try{ window.storage.delete('files:docrecord:'+d.id, true); }catch(e){}
-  closeDocRecordDrawer();
-  render();
-  showToast('Document deleted.');
+  if(!confirm('Delete document "'+(d.title||d.type)+'"?')) return;
+  try{
+    await OMNA.remove('docRecord', d.id);
+    try{ await OMNA.files.delAllFor('docrecord:'+d.id); }catch(e){}
+    state.documents = state.documents.filter(x=>x.id!==d.id);
+    closeDocRecordDrawer();
+    render();
+    showToast('Document deleted.');
+  }catch(e){ showToast(e && e.message ? e.message : 'Could not delete the document.'); }
 }
 function renderDocRecordDrawer(){
   const d = getActiveDocRecord();
@@ -3047,82 +3126,121 @@ function renderDocRecordDrawer(){
     '</div>';
 }
 
-/* ---------- Access gate (basic shared-password lock, not full security) ---------- */
-async function sha256(text){
-  const enc = new TextEncoder().encode(text);
-  const buf = await crypto.subtle.digest('SHA-256', enc);
-  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
-}
+/* ---------- Sign-in (per-user accounts, roles enforced on the server) ---------- */
+function omnaLockBox(){ return document.getElementById('lock-box'); }
+
 async function checkAuth(){
-  let stored = null;
-  try{
-    const r = await window.storage.get('accessPasswordHash', true);
-    stored = r ? r.value : null;
-  }catch(e){ stored = null; }
-  if(!stored){
-    renderLockSet();
-  } else {
-    renderLockEnter();
-  }
+  if(!OMNA.configured()){ renderNeedsConfig(); return; }
+  if(OMNA.restoreSession()){ unlockApp(); return; }
+  renderLogin();
 }
-function renderLockSet(){
-  document.getElementById('lock-box').innerHTML =
+
+function renderNeedsConfig(){
+  omnaLockBox().innerHTML =
     '<div class="lock-brand"><div class="mark">OMNA</div></div>'+
-    '<h3>Set a team access password</h3>'+
-    '<div id="lock-error" class="lock-error" style="display:none;"></div>'+
-    '<div class="field"><label>Password</label><input type="password" id="lock-pass1" placeholder="Choose a password"></div>'+
-    '<div class="field"><label>Confirm password</label><input type="password" id="lock-pass2" placeholder="Re-enter password"></div>'+
-    '<button class="btn btn-primary" style="width:100%;" onclick="submitSetPassword()">Set password &amp; continue</button>'+
-    '<div class="lock-note">This is a basic shared access gate for convenience, not full security. Everyone on the team will use this same password. Do not rely on this alone to protect highly sensitive data from a determined technical attacker.</div>';
+    '<h3>Not connected yet</h3>'+
+    '<div class="lock-note">The backend address has not been set. Open <code>index.html</code>, '+
+    'find <code>API_URL</code> near the top of the script, and paste the Apps Script Web App URL '+
+    '(it ends in <code>/exec</code>).</div>';
 }
-function renderLockEnter(){
-  document.getElementById('lock-box').innerHTML =
+
+function renderLogin(message){
+  omnaLockBox().innerHTML =
     '<div class="lock-brand"><div class="mark">OMNA</div></div>'+
-    '<h3>Enter team access password</h3>'+
-    '<div id="lock-error" class="lock-error" style="display:none;"></div>'+
-    '<div class="field"><label>Password</label><input type="password" id="lock-pass" placeholder="Password" onkeydown="if(event.key===\'Enter\') submitEnterPassword()"></div>'+
-    '<button class="btn btn-primary" style="width:100%;" onclick="submitEnterPassword()">Unlock</button>'+
-    '<div class="lock-note">Ask your team admin if you don\'t have the password. It can be changed anytime from Settings once inside.</div>';
+    '<h3>Sign in</h3>'+
+    '<div id="lock-error" class="lock-error" style="display:'+(message?'block':'none')+';">'+
+      (message ? escapeHtml(message) : '')+'</div>'+
+    '<div class="field"><label>Email</label><input type="email" id="lock-email" placeholder="you@example.com" autocomplete="username"></div>'+
+    '<div class="field"><label>Password</label><input type="password" id="lock-pass" placeholder="Password" autocomplete="current-password" onkeydown="if(event.key===\'Enter\') submitLogin()"></div>'+
+    '<button class="btn btn-primary" style="width:100%;" id="lock-btn" onclick="submitLogin()">Sign in</button>'+
+    '<div class="lock-note">Each person has their own account. Ask your administrator to add you, '+
+    'or to reset your password, in the Users tab of the register spreadsheet.</div>';
+  const el = document.getElementById('lock-email'); if(el) el.focus();
 }
-async function submitSetPassword(){
-  const p1 = document.getElementById('lock-pass1').value;
-  const p2 = document.getElementById('lock-pass2').value;
-  const err = document.getElementById('lock-error');
-  if(p1.length < 4){ err.textContent = 'Password should be at least 4 characters.'; err.style.display='block'; return; }
-  if(p1 !== p2){ err.textContent = 'Passwords do not match.'; err.style.display='block'; return; }
-  const hash = await sha256(p1);
+
+async function submitLogin(){
+  const email = (document.getElementById('lock-email').value||'').trim();
+  const pass  = document.getElementById('lock-pass').value;
+  const err   = document.getElementById('lock-error');
+  const btn   = document.getElementById('lock-btn');
+  err.style.display = 'none';
+  btn.disabled = true; btn.textContent = 'Signing in...';
   try{
-    await window.storage.set('accessPasswordHash', hash, true);
-  }catch(e){ err.textContent = 'Failed to save password. Please try again.'; err.style.display='block'; return; }
-  unlockApp();
-}
-async function submitEnterPassword(){
-  const p = document.getElementById('lock-pass').value;
-  const err = document.getElementById('lock-error');
-  let stored = null;
-  try{
-    const r = await window.storage.get('accessPasswordHash', true);
-    stored = r ? r.value : null;
-  }catch(e){}
-  const hash = await sha256(p);
-  if(stored && hash === stored){
+    await OMNA.login(email, pass);
     unlockApp();
-  } else {
-    err.textContent = 'Incorrect password.';
+  }catch(e){
+    err.textContent = e && e.message ? e.message : 'Could not sign in.';
     err.style.display = 'block';
+    btn.disabled = false; btn.textContent = 'Sign in';
   }
 }
+
+window.omnaForceLogin = function(msg){
+  document.getElementById('app-root').style.display = 'none';
+  document.getElementById('lock-screen').style.display = 'flex';
+  renderLogin(msg || 'Please sign in again.');
+};
+
+function omnaSignOut(){
+  OMNA.signOut();
+  location.reload();
+}
+
+/* Shows who is signed in, and makes a view-only session obvious. */
+function omnaRenderIdentityBar(){
+  const u = OMNA.user(); if(!u) return;
+  let bar = document.getElementById('omna-identity');
+  if(!bar){
+    bar = document.createElement('div');
+    bar.id = 'omna-identity';
+    bar.style.cssText = 'position:fixed;right:14px;bottom:12px;z-index:9998;display:flex;gap:8px;'+
+      'align-items:center;background:var(--navy-deep,#0E2A3B);color:#fff;border-radius:999px;'+
+      'padding:6px 10px 6px 14px;font:12.5px/1 system-ui,-apple-system,Segoe UI,sans-serif;'+
+      'box-shadow:0 3px 12px rgba(0,0,0,.25);opacity:.92';
+    document.body.appendChild(bar);
+  }
+  const roleLabel = u.role === 'viewer' ? 'view only' : u.role;
+  bar.innerHTML =
+    '<span>'+escapeHtml(u.email)+' \u00b7 <strong>'+escapeHtml(roleLabel)+'</strong></span>'+
+    '<button type="button" onclick="openChangePassword()" style="background:transparent;color:#fff;'+
+      'border:1px solid rgba(255,255,255,.45);border-radius:999px;padding:3px 9px;cursor:pointer;font-size:12px">Password</button>'+
+    '<button type="button" onclick="omnaSignOut()" style="background:#fff;color:#0E2A3B;border:0;'+
+      'border-radius:999px;padding:3px 10px;cursor:pointer;font-weight:600;font-size:12px">Sign out</button>';
+
+  if(!OMNA.canEdit()) omnaApplyViewOnly();
+}
+
+/* A viewer cannot change anything: the server refuses, and the UI says so
+   rather than letting someone type into fields that will never save. */
+function omnaApplyViewOnly(){
+  if(document.getElementById('omna-viewonly-note')) return;
+  const note = document.createElement('div');
+  note.id = 'omna-viewonly-note';
+  note.style.cssText = 'position:fixed;left:14px;bottom:12px;z-index:9998;background:#7A5B00;color:#fff;'+
+    'border-radius:999px;padding:6px 14px;font:12.5px/1 system-ui,-apple-system,Segoe UI,sans-serif;'+
+    'box-shadow:0 3px 12px rgba(0,0,0,.25);opacity:.92';
+  note.textContent = 'View-only account \u2014 changes are not saved';
+  document.body.appendChild(note);
+
+  ['btn-new-primary','btn-import','btn-restore'].forEach(function(id){
+    const b = document.getElementById(id);
+    if(b){ b.disabled = true; b.style.opacity = '.45'; b.style.cursor = 'not-allowed'; b.onclick = function(){
+      showToast('Your account has view-only access.'); return false; }; }
+  });
+}
+
 function unlockApp(){
   document.getElementById('lock-screen').style.display = 'none';
   document.getElementById('app-root').style.display = 'flex';
-  loadData().then(function(){ if (window.OMNA_GUARD && window.OMNA_GUARD.degraded) window.omnaRenderGuardBanner(); });
+  loadData();
 }
+
 function openChangePassword(){
   document.getElementById('modal').innerHTML =
-    '<h3>Change team access password</h3>'+
+    '<h3>Change your password</h3>'+
     '<div id="cp-error" class="lock-error" style="display:none;"></div>'+
     '<div class="field"><label>Current password</label><input type="password" id="cp-current"></div>'+
-    '<div class="field"><label>New password</label><input type="password" id="cp-new1"></div>'+
+    '<div class="field"><label>New password</label><input type="password" id="cp-new1" placeholder="At least 8 characters"></div>'+
     '<div class="field"><label>Confirm new password</label><input type="password" id="cp-new2"></div>'+
     '<div class="modal-actions">'+
     '<button class="btn" onclick="closeModal()">Cancel</button>'+
@@ -3130,24 +3248,20 @@ function openChangePassword(){
     '</div>';
   document.getElementById('modal-overlay').classList.add('open');
 }
+
 async function submitChangePassword(){
   const current = document.getElementById('cp-current').value;
   const n1 = document.getElementById('cp-new1').value;
   const n2 = document.getElementById('cp-new2').value;
   const err = document.getElementById('cp-error');
-  let stored = null;
-  try{
-    const r = await window.storage.get('accessPasswordHash', true);
-    stored = r ? r.value : null;
-  }catch(e){}
-  const currentHash = await sha256(current);
-  if(stored && currentHash !== stored){ err.textContent='Current password is incorrect.'; err.style.display='block'; return; }
-  if(n1.length < 4){ err.textContent='New password should be at least 4 characters.'; err.style.display='block'; return; }
+  if(n1.length < 8){ err.textContent='New password should be at least 8 characters.'; err.style.display='block'; return; }
   if(n1 !== n2){ err.textContent='New passwords do not match.'; err.style.display='block'; return; }
-  const newHash = await sha256(n1);
   try{
-    await window.storage.set('accessPasswordHash', newHash, true);
-  }catch(e){ err.textContent='Failed to save. Try again.'; err.style.display='block'; return; }
+    await OMNA.changePassword(current, n1);
+  }catch(e){
+    err.textContent = e && e.message ? e.message : 'Could not update the password.';
+    err.style.display='block'; return;
+  }
   closeModal();
   showToast('Password updated.');
 }
