@@ -457,6 +457,7 @@
    Replaces the old key/value blob store. A save now writes exactly one
    spreadsheet row, so no single failure can affect the other records.
    ======================================================================= */
+window.OMNA_BUILD = '2026-09-25 / placements-admin-delete';
 window.OMNA = (function(){
 
   // ---------------------------------------------------------------------
@@ -1160,6 +1161,7 @@ function renderSettings(){
     '</div>'
   ).join('');
 
+  const canRemovePlacement = OMNA.isAdmin();
   const placementRows = state.corridors.map((c,i)=>{
     const inUse = state.candidates.filter(x=>x.corridor===c).length;
     return '<div class="item-row">'+
@@ -1168,7 +1170,9 @@ function renderSettings(){
     '<input class="item-name" style="border:1px solid var(--line); border-radius:5px; padding:4px 8px;" value="'+escapeAttr(c)+'" onchange="renamePlacement('+i+', this.value)">'+
     '<span style="font-size:11.5px; color:var(--ink-soft); white-space:nowrap; padding:0 8px;">'+
       (inUse ? inUse + (inUse===1?' candidate':' candidates') : 'unused')+'</span>'+
-    '<button class="item-del" title="'+(inUse?'In use — rename or reassign first':'Remove')+'" onclick="removePlacement('+i+')">&times;</button>'+
+    '<button class="item-del"'+(canRemovePlacement?'':' style="opacity:.3; cursor:not-allowed;"')+
+      ' title="'+(canRemovePlacement ? (inUse?'Remove — in use by '+inUse:'Remove') : 'Only an administrator can remove a placement')+
+      '" onclick="removePlacement('+i+')">&times;</button>'+
     '</div>';
   }).join('');
 
@@ -1193,7 +1197,10 @@ function renderSettings(){
     '<div class="panel"><div class="panel-head"><h3>Placements</h3></div><div class="panel-body" style="padding:12px 18px;">'+
     placementRows+
     '<div class="add-item-row" style="margin-top:10px;"><input id="new-placement-name" placeholder="e.g. Netherlands" onkeydown="if(event.key===\'Enter\') addPlacement()"><button class="btn btn-sm" onclick="addPlacement()">Add placement</button></div>'+
-    '<div class="file-hint">Destination countries and programmes. Renaming one moves every candidate on it to the new name, along with its default document checklist. A placement still in use cannot be removed &mdash; rename it, or move those candidates first.</div>'+
+    '<div class="file-hint">Destination countries and programmes. Renaming one moves every candidate on it to the new name, along with its default document checklist. '+
+    (canRemovePlacement
+      ? 'Only administrators can remove a placement, and removing one that is still in use asks you to confirm by typing its name.'
+      : 'Removing a placement is restricted to administrator accounts.')+'</div>'+
     '</div></div>'+
 
     '<div class="panel"><div class="panel-head"><h3>Process stages</h3></div><div class="panel-body" style="padding:12px 18px;">'+
@@ -1238,7 +1245,8 @@ function renderSettings(){
 
     '<div class="panel"><div class="panel-head"><h3>Your account</h3></div><div class="panel-body" style="padding:12px 18px;">'+
     '<button class="btn btn-sm" onclick="openChangePassword()">Change my password</button>'+
-    '<div class="file-hint">Each person signs in with their own account. To add someone, change a role, or revoke access, edit the <strong>Users</strong> tab of the register spreadsheet.</div>'+
+    '<div class="file-hint">Each person signs in with their own account. To add someone, change a role, or revoke access, edit the <strong>Users</strong> tab of the register spreadsheet.'+
+    '<br><span style="opacity:.7;">Signed in as <strong>'+escapeHtml((OMNA.user()||{}).email||'')+'</strong> ('+escapeHtml(OMNA.role()||'')+') &middot; app build '+escapeHtml(window.OMNA_BUILD)+'</span></div>'+
     '</div></div>';
 }
 function renderImportBanner(){
@@ -2076,16 +2084,29 @@ async function renamePlacement(i, rawValue){
 }
 
 async function removePlacement(i){
-  if(!OMNA.canEdit()){ showToast('Your account has view-only access.'); return; }
-  const name = state.corridors[i];
-  const count = state.candidates.filter(c=>c.corridor===name).length;
-  if(count){
-    alert('"'+name+'" is still used by '+count+' candidate'+(count===1?'':'s')+'.\n\n'+
-          'Removing it now would leave them pointing at a placement that no longer exists. '+
-          'Rename it instead, or move those candidates to another placement first.');
+  // Deleting a placement is restricted to administrators: it is the one action
+  // here that can quietly detach candidates from the lists and filters.
+  if(!OMNA.isAdmin()){
+    showToast('Only an administrator can remove a placement.');
     return;
   }
-  if(!confirm('Remove the placement "'+name+'"?')) return;
+  const name = state.corridors[i];
+  const count = state.candidates.filter(c=>c.corridor===name).length;
+
+  if(count){
+    const typed = prompt(
+      'WARNING — "'+name+'" is currently used by '+count+' candidate'+(count===1?'':'s')+'.\n\n'+
+      'Those candidates will NOT be deleted. They keep "'+name+'" on their record, but the '+
+      'placement disappears from the list, the filters and the dashboard until you add it back '+
+      'with exactly the same spelling.\n\n'+
+      'Its default document checklist will also be deleted.\n\n'+
+      'To confirm, type the placement name exactly as shown:'
+    );
+    if(typed === null) return;
+    if(typed.trim() !== name){ showToast('That did not match — nothing was removed.'); return; }
+  } else {
+    if(!confirm('Remove the placement "'+name+'"?\n\nNo candidates are using it, so nothing else is affected.')) return;
+  }
   state.corridors.splice(i,1);
   if(state.docTemplates[name] !== undefined){
     delete state.docTemplates[name];
@@ -2095,7 +2116,9 @@ async function removePlacement(i){
   if(state.filterCorridor === name) state.filterCorridor = '';
   await saveCorridors();
   render();
-  showToast('Placement removed.');
+  showToast(count
+    ? 'Placement removed. '+count+' candidate'+(count===1?'':'s')+' still carry the name "'+name+'".'
+    : 'Placement removed.');
 }
 
 /* ---------- Settings: document templates ---------- */
