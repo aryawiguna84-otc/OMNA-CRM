@@ -1160,6 +1160,18 @@ function renderSettings(){
     '</div>'
   ).join('');
 
+  const placementRows = state.corridors.map((c,i)=>{
+    const inUse = state.candidates.filter(x=>x.corridor===c).length;
+    return '<div class="item-row">'+
+    '<button class="doc-link-btn" title="Move up" '+(i===0?'disabled style="opacity:0.3;"':'onclick="movePlacement('+i+',-1)"')+'>&uarr;</button>'+
+    '<button class="doc-link-btn" title="Move down" '+(i===state.corridors.length-1?'disabled style="opacity:0.3;"':'onclick="movePlacement('+i+',1)"')+'>&darr;</button>'+
+    '<input class="item-name" style="border:1px solid var(--line); border-radius:5px; padding:4px 8px;" value="'+escapeAttr(c)+'" onchange="renamePlacement('+i+', this.value)">'+
+    '<span style="font-size:11.5px; color:var(--ink-soft); white-space:nowrap; padding:0 8px;">'+
+      (inUse ? inUse + (inUse===1?' candidate':' candidates') : 'unused')+'</span>'+
+    '<button class="item-del" title="'+(inUse?'In use — rename or reassign first':'Remove')+'" onclick="removePlacement('+i+')">&times;</button>'+
+    '</div>';
+  }).join('');
+
   const corridorOptions = state.corridors.map(c=>'<option value="'+escapeAttr(c)+'"'+(state.settingsTemplateCorridor===c?' selected':'')+'>'+c+'</option>').join('');
   const tplCorridor = state.settingsTemplateCorridor || state.corridors[0] || '';
   const tplDocs = state.docTemplates[tplCorridor] || [];
@@ -1178,6 +1190,12 @@ function renderSettings(){
   ).join('');
 
   return ''+
+    '<div class="panel"><div class="panel-head"><h3>Placements</h3></div><div class="panel-body" style="padding:12px 18px;">'+
+    placementRows+
+    '<div class="add-item-row" style="margin-top:10px;"><input id="new-placement-name" placeholder="e.g. Netherlands" onkeydown="if(event.key===\'Enter\') addPlacement()"><button class="btn btn-sm" onclick="addPlacement()">Add placement</button></div>'+
+    '<div class="file-hint">Destination countries and programmes. Renaming one moves every candidate on it to the new name, along with its default document checklist. A placement still in use cannot be removed &mdash; rename it, or move those candidates first.</div>'+
+    '</div></div>'+
+
     '<div class="panel"><div class="panel-head"><h3>Process stages</h3></div><div class="panel-body" style="padding:12px 18px;">'+
     stageRows+
     '<div class="add-item-row" style="margin-top:10px;"><input id="new-stage-name" placeholder="New stage name"><button class="btn btn-sm" onclick="addStage()">Add stage</button></div>'+
@@ -1218,9 +1236,9 @@ function renderSettings(){
     '<div class="field" style="max-width:220px;"><label>Custom color</label><input type="color" value="'+state.theme.deep+'" onchange="setThemeFromCustomHex(this.value)" style="height:38px; padding:2px;"></div>'+
     '</div></div>'+
 
-    '<div class="panel"><div class="panel-head"><h3>Team access</h3></div><div class="panel-body" style="padding:12px 18px;">'+
-    '<button class="btn btn-sm" onclick="openChangePassword()">Change team password</button>'+
-    '<div class="file-hint">Everyone on the team uses the same password to open this app. Changing it here updates access for everyone next time they open it.</div>'+
+    '<div class="panel"><div class="panel-head"><h3>Your account</h3></div><div class="panel-body" style="padding:12px 18px;">'+
+    '<button class="btn btn-sm" onclick="openChangePassword()">Change my password</button>'+
+    '<div class="file-hint">Each person signs in with their own account. To add someone, change a role, or revoke access, edit the <strong>Users</strong> tab of the register spreadsheet.</div>'+
     '</div></div>';
 }
 function renderImportBanner(){
@@ -1993,6 +2011,91 @@ function moveStage(i, dir){
   state.stages[j] = tmp;
   saveStages();
   render();
+}
+
+/* ---------- Settings: placements ---------- */
+function addPlacement(){
+  if(!OMNA.canEdit()){ showToast('Your account has view-only access.'); return; }
+  const el = document.getElementById('new-placement-name');
+  const v = (el.value||'').trim();
+  if(!v){ showToast('Placement name is required.'); return; }
+  if(state.corridors.some(c=>c.toLowerCase()===v.toLowerCase())){ showToast('That placement already exists.'); return; }
+  state.corridors.push(v);
+  el.value = '';
+  saveCorridors();
+  render();
+  showToast('Placement added.');
+}
+
+function movePlacement(i, dir){
+  if(!OMNA.canEdit()){ showToast('Your account has view-only access.'); return; }
+  const j = i+dir;
+  if(j<0 || j>=state.corridors.length) return;
+  const tmp = state.corridors[i];
+  state.corridors[i] = state.corridors[j];
+  state.corridors[j] = tmp;
+  saveCorridors();
+  render();
+}
+
+/* Renaming is done on the server in a single pass: a busy placement can cover
+   hundreds of candidates, and updating them one request at a time would take
+   many minutes and could half-finish. */
+async function renamePlacement(i, rawValue){
+  if(!OMNA.canEdit()){ showToast('Your account has view-only access.'); render(); return; }
+  const oldName = state.corridors[i];
+  const newName = (rawValue||'').trim();
+  if(!newName){ showToast('Placement name cannot be empty.'); render(); return; }
+  if(newName === oldName) return;
+  if(state.corridors.some((c,j)=>j!==i && c.toLowerCase()===newName.toLowerCase())){
+    showToast('A placement with that name already exists.'); render(); return;
+  }
+
+  const count = state.candidates.filter(c=>c.corridor===oldName).length;
+  if(count && !confirm('Rename "'+oldName+'" to "'+newName+'"?\n\n'+count+' candidate'+(count===1?'':'s')+' will move to the new name.')){
+    render(); return;
+  }
+
+  showToast('Renaming placement...');
+  try{
+    const res = await OMNA._call('renameCorridor', {oldName: oldName, newName: newName});
+    state.corridors[i] = newName;
+    state.candidates.forEach(c=>{ if(c.corridor===oldName) c.corridor = newName; });
+    if(state.docTemplates[oldName] !== undefined){
+      state.docTemplates[newName] = state.docTemplates[oldName];
+      delete state.docTemplates[oldName];
+    }
+    if(state.settingsTemplateCorridor === oldName) state.settingsTemplateCorridor = newName;
+    if(state.filterCorridor === oldName) state.filterCorridor = newName;
+    render();
+    showToast('Renamed to "'+newName+'" — '+(res.updated||0)+' candidate'+((res.updated||0)===1?'':'s')+' updated.');
+  }catch(e){
+    showToast(e && e.message ? e.message : 'Could not rename the placement.');
+    render();
+  }
+}
+
+async function removePlacement(i){
+  if(!OMNA.canEdit()){ showToast('Your account has view-only access.'); return; }
+  const name = state.corridors[i];
+  const count = state.candidates.filter(c=>c.corridor===name).length;
+  if(count){
+    alert('"'+name+'" is still used by '+count+' candidate'+(count===1?'':'s')+'.\n\n'+
+          'Removing it now would leave them pointing at a placement that no longer exists. '+
+          'Rename it instead, or move those candidates to another placement first.');
+    return;
+  }
+  if(!confirm('Remove the placement "'+name+'"?')) return;
+  state.corridors.splice(i,1);
+  if(state.docTemplates[name] !== undefined){
+    delete state.docTemplates[name];
+    try{ await saveDocTemplates(); }catch(e){}
+  }
+  if(state.settingsTemplateCorridor === name) state.settingsTemplateCorridor = state.corridors[0] || '';
+  if(state.filterCorridor === name) state.filterCorridor = '';
+  await saveCorridors();
+  render();
+  showToast('Placement removed.');
 }
 
 /* ---------- Settings: document templates ---------- */
